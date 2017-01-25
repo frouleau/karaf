@@ -16,6 +16,7 @@
  */
 package org.apache.karaf.config.command;
 
+import java.util.Arrays;
 import java.util.Dictionary;
 
 import org.apache.karaf.config.core.ConfigRepository;
@@ -34,6 +35,7 @@ public abstract class ConfigCommandSupport implements Action {
     public static final String PROPERTY_CONFIG_PID = "ConfigCommand.PID";
     public static final String PROPERTY_CONFIG_PROPS = "ConfigCommand.Props";
     public static final String PROPERTY_FACTORY = "ConfigCommand.Factory";
+    public static final String PROPERTY_ALIAS = "ConfigCommand.Alias";
 
     @Reference
     protected ConfigRepository configRepository;
@@ -52,12 +54,22 @@ public abstract class ConfigCommandSupport implements Action {
     protected Dictionary getEditedProps() throws Exception {
         return (Dictionary) this.session.get(PROPERTY_CONFIG_PROPS);
     }
-    
+
     public void setConfigRepository(ConfigRepository configRepository) {
         this.configRepository = configRepository;
     }
 
     public void setSession(Session session) {
         this.session = session;
+    }
+
+    protected String displayValue(Object value) {
+        if (value == null) {
+            return "<null>";
+        }
+        if (value.getClass().isArray()) {
+            return Arrays.toString((Object[]) value);
+        }
+        return value.toString();
     }
 }

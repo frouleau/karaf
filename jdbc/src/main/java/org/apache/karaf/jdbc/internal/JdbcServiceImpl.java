@@ -54,7 +54,7 @@ public class JdbcServiceImpl implements JdbcService {
     private ConfigurationAdmin configAdmin;
     
     @Override
-    public void create(String name, String driverName, String driverClass, String databaseName, String url, String user, String password) throws Exception {
+    public void create(String name, String driverName, String driverClass, String databaseName, String url, String user, String password, String databaseType) throws Exception {
         if (driverName == null && driverClass == null) {
             throw new IllegalStateException("No driverName or driverClass supplied");
         }
@@ -63,26 +63,21 @@ public class JdbcServiceImpl implements JdbcService {
         }
         Dictionary<String, String> properties = new Hashtable<String, String>();
         properties.put(DataSourceFactory.JDBC_DATASOURCE_NAME, name);
-        if (driverName != null) {
-            properties.put(DataSourceFactory.OSGI_JDBC_DRIVER_NAME, driverName);
-        }
-        if (driverClass != null) {
-            properties.put(DataSourceFactory.OSGI_JDBC_DRIVER_CLASS, driverClass);
-        }
-        if (databaseName != null) {
-            properties.put(DataSourceFactory.JDBC_DATABASE_NAME, databaseName);
-        }
-        if (url != null) {
-            properties.put(DataSourceFactory.JDBC_URL, url);
-        }
-        if (user != null) {
-            properties.put(DataSourceFactory.JDBC_USER, user);
-        }
-        if (password != null) {
-            properties.put(DataSourceFactory.JDBC_PASSWORD, password);
-        }
+        put(properties, DataSourceFactory.OSGI_JDBC_DRIVER_NAME, driverName);
+        put(properties, DataSourceFactory.OSGI_JDBC_DRIVER_CLASS, driverClass);
+        put(properties, DataSourceFactory.JDBC_DATABASE_NAME, databaseName);
+        put(properties, DataSourceFactory.JDBC_URL, url);
+        put(properties, DataSourceFactory.JDBC_USER, user);
+        put(properties, DataSourceFactory.JDBC_PASSWORD, password);
+        put(properties, "dataSourceType", databaseType);
         Configuration config = configAdmin.createFactoryConfiguration("org.ops4j.datasource", null);
         config.update(properties);
+    }
+
+    private void put(Dictionary<String, String> properties, String key, String value) {
+        if (value != null) {
+            properties.put(key, value);
+        }
     }
 
     @Override

@@ -18,6 +18,7 @@
  */
 package org.apache.karaf.shell.api.console;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -35,4 +36,15 @@ public interface Completer {
      */
     int complete(Session session, CommandLine commandLine, List<String> candidates);
 
+    default void completeCandidates(Session session, CommandLine commandLine, List<Candidate> candidates) {
+        List<String> strings = new ArrayList<>();
+        int idx = complete(session, commandLine, strings);
+        String word = "";
+        if (idx > commandLine.getBufferPosition() - commandLine.getArgumentPosition()) {
+            word = commandLine.getBuffer().substring(commandLine.getBufferPosition() - commandLine.getArgumentPosition(), idx);
+        }
+        for (String string : strings) {
+            candidates.add(new Candidate(word + string));
+        }
+    }
 }

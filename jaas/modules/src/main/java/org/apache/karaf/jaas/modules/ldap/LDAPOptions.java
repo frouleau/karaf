@@ -45,6 +45,7 @@ public class LDAPOptions {
     public static final String ROLE_MAPPING = "role.mapping";
     public static final String AUTHENTICATION = "authentication";
     public static final String ALLOW_EMPTY_PASSWORDS = "allowEmptyPasswords";
+    public static final String DISABLE_CACHE = "disableCache";
     public static final String INITIAL_CONTEXT_FACTORY = "initial.context.factory";
     public static final String CONTEXT_PREFIX = "context.";
     public static final String SSL = "ssl";
@@ -55,6 +56,7 @@ public class LDAPOptions {
     public static final String SSL_KEYALIAS = "ssl.keyalias";
     public static final String SSL_TRUSTSTORE = "ssl.truststore";
     public static final String SSL_TIMEOUT = "ssl.timeout";
+    public static final String USERNAMES_TRIM = "usernames.trim";
     public static final String DEFAULT_INITIAL_CONTEXT_FACTORY = "com.sun.jndi.ldap.LdapCtxFactory";
     public static final String DEFAULT_AUTHENTICATION = "simple";
     public static final int DEFAULT_SSL_TIMEOUT = 10;
@@ -79,6 +81,10 @@ public class LDAPOptions {
     @Override
     public int hashCode() {
         return options.hashCode();
+    }
+
+    public boolean isUsernameTrim() {
+        return Boolean.parseBoolean((String) options.get(USERNAMES_TRIM));
     }
 
     public String getUserFilter() {
@@ -172,7 +178,7 @@ public class LDAPOptions {
             SSLSocketFactory factory = manager.createSSLFactory(
                     getSslProvider(), getSslProtocol(), getSslAlgorithm(), getSslKeystore(),
                     getSslKeyAlias(), getSslTrustStore(), getSslTimeout());
-            ManagedSSLSocketFactory.setSocketFactory(factory);
+            ManagedSSLSocketFactory.setSocketFactory(new ManagedSSLSocketFactory(factory));
             Thread.currentThread().setContextClassLoader(ManagedSSLSocketFactory.class.getClassLoader());
         } catch (Exception e) {
             throw new NamingException("Unable to setup SSL support for LDAP: " + e.getMessage());
@@ -260,4 +266,9 @@ public class LDAPOptions {
     public boolean getAllowEmptyPasswords() {
         return Boolean.parseBoolean((String) options.get(ALLOW_EMPTY_PASSWORDS));
     }
+
+    public boolean getDisableCache() {
+        return Boolean.parseBoolean((String) options.get(DISABLE_CACHE));
+    }
+
 }

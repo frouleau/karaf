@@ -16,12 +16,17 @@ package org.apache.karaf.itests;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+
+import org.ops4j.pax.exam.Configuration;
+import org.ops4j.pax.exam.MavenUtils;
+import org.ops4j.pax.exam.Option;
 import org.ops4j.pax.exam.junit.PaxExam;
 import org.ops4j.pax.exam.spi.reactors.ExamReactorStrategy;
 import org.ops4j.pax.exam.spi.reactors.PerClass;
 
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertEquals;
+import static org.ops4j.pax.exam.karaf.options.KarafDistributionOption.editConfigurationFilePut;
 
 import javax.jms.ConnectionFactory;
 import javax.management.MBeanServer;
@@ -29,16 +34,33 @@ import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
 import java.net.Socket;
 import java.net.URI;
+import java.util.Arrays;
+import java.util.LinkedList;
 import java.util.List;
 
 @RunWith(PaxExam.class)
 @ExamReactorStrategy(PerClass.class)
 public class JmsTest extends KarafTestSupport {
 
+    @Configuration
+    public Option[] config() {
+        String version = MavenUtils.getArtifactVersion("org.apache.karaf", "apache-karaf");
+        List<Option> result = new LinkedList<>(Arrays.asList(super.config()));
+        result.add(editConfigurationFilePut("etc/org.apache.karaf.features.cfg", "featuresRepositories",
+                        "mvn:org.apache.karaf.features/framework/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/spring/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/spring-legacy/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/enterprise/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/enterprise-legacy/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/standard/" + version + "/xml/features"));
+        return result.toArray(new Option[result.size()]);
+    }
+
     @Before
     public void installJmsFeatureAndActiveMQBroker() throws Exception {
         installAndAssertFeature("jms");
-        featureService.addRepository(new URI("mvn:org.apache.activemq/activemq-karaf/5.10.0/xml/features"));
+        featureService
+            .addRepository(new URI("mvn:org.apache.activemq/activemq-karaf/5.10.0/xml/features"));
         installAndAssertFeature("activemq-broker-noweb");
         // check if ActiveMQ is completely started
         System.out.println("Waiting for the ActiveMQ transport connector on 61616 ...");
@@ -56,6 +78,7 @@ public class JmsTest extends KarafTestSupport {
 
     @Test(timeout = 120000)
     public void testCommands() throws Exception {
+        System.out.println("===>testCommands");
         // jms:create command
         System.out.println(executeCommand("jms:create -t ActiveMQ -u karaf -p karaf --url tcp://localhost:61616 test"));
         // give time to fileinstall to load the blueprint file by looking for the connection factory OSGi service
@@ -105,6 +128,7 @@ public class JmsTest extends KarafTestSupport {
 
     @Test(timeout = 120000)
     public void testMBean() throws Exception {
+        System.out.println("===>testMBean");
         MBeanServer mbeanServer = ManagementFactory.getPlatformMBeanServer();
         ObjectName name = new ObjectName("org.apache.karaf:type=jms,name=root");
         // create operation

@@ -135,7 +135,6 @@
                             org.eclipse.equinox.region.*
                         </Export-Package>
                         <Import-Package>
-                            !org.apache.felix.resolver,
                             !org.eclipse.osgi.service.resolver,
                             *
                         </Import-Package>
@@ -148,7 +147,9 @@
                             org.apache.karaf.util,
                             org.apache.karaf.util.bundles,
                             org.apache.karaf.util.collections,
+                            org.apache.karaf.util.maven,
                             org.eclipse.equinox.internal.region.*;-split-package:=merge-first,
+                            org.apache.felix.resolver.*,
                         </Private-Package>
                         <Embed-Dependency>
                             org.apache.karaf.util;inline="org/apache/karaf/util/XmlUtils*.class"

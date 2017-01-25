@@ -19,7 +19,6 @@
 package org.apache.karaf.shell.ssh;
 
 import java.io.Closeable;
-import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -68,6 +67,10 @@ public class ShellFactoryImpl implements Factory<Command> {
 
         private ServerSession session;
 
+        private Session shell;
+
+        private SshTerminal terminal;
+
         private boolean closed;
 
         public void setInputStream(final InputStream in) {
@@ -94,38 +97,27 @@ public class ShellFactoryImpl implements Factory<Command> {
             try {
                 final Subject subject = ShellImpl.this.session != null ? ShellImpl.this.session
                         .getAttribute(KarafJaasAuthenticator.SUBJECT_ATTRIBUTE_KEY) : null;
-                final Terminal terminal = new SshTerminal(env);
-                Runnable destroyCallback = new Runnable() {
-                    public void run() {
-                        destroy();
-                    }
-                };
-                String encoding = getEncoding();
-                final Session session = sessionFactory.create(in,
-                        lfToCrLfPrintStream(out), lfToCrLfPrintStream(err), terminal, encoding, destroyCallback);
+                String encoding = getEncoding(env);
+                final PrintStream pout = out instanceof PrintStream ? (PrintStream) out : new PrintStream(out, false, encoding);
+                final PrintStream perr = err instanceof PrintStream ? (PrintStream) err : out == err ? pout : new PrintStream(err, false, encoding);
+                terminal = new SshTerminal(env, in, pout);
+                shell = sessionFactory.create(in,
+                        pout, perr, terminal, encoding, this::destroy);
                 for (Map.Entry<String, String> e : env.getEnv().entrySet()) {
-                    session.put(e.getKey(), e.getValue());
+                    shell.put(e.getKey(), e.getValue());
                 }
-                JaasHelper.doAs(subject, new PrivilegedAction<Object>() {
-                    public Object run() {
-                        new Thread(session, "Karaf ssh console user " + ShellUtil.getCurrentUserName()).start();
-                        return null;
-                    }
-                });
+                JaasHelper.runAs(subject, () ->
+                    new Thread(shell, "Karaf ssh console user " + ShellUtil.getCurrentUserName()).start());
             } catch (Exception e) {
                 throw (IOException) new IOException("Unable to start shell").initCause(e);
             }
         }
 
-        private PrintStream lfToCrLfPrintStream(OutputStream stream) {
-            return new PrintStream(new LfToCrLfFilterOutputStream(stream), true);
-        }
-
         public void destroy() {
             if (!closed) {
                 closed = true;
-                ShellFactoryImpl.flush(out, err);
-                ShellFactoryImpl.close(in, out, err);
+                flush(out, err);
+                close(in, out, err);
                 callback.onExit(0);
             }
         }
@@ -138,9 +130,10 @@ public class ShellFactoryImpl implements Factory<Command> {
      *
      * @return The default encoding to use when none is specified.
      */
-    public static String getEncoding() {
+    public static String getEncoding(Environment env) {
         // LC_CTYPE is usually in the form en_US.UTF-8
-        String envEncoding = extractEncodingFromCtype(System.getenv("LC_CTYPE"));
+        String ctype = env.getEnv().getOrDefault("LC_TYPE", System.getenv("LC_CTYPE"));
+        String envEncoding = extractEncodingFromCtype(ctype);
         if (envEncoding != null) {
             return envEncoding;
         }
@@ -180,32 +173,10 @@ public class ShellFactoryImpl implements Factory<Command> {
         for (Closeable c : closeables) {
             try {
                 c.close();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 // Ignore
             }
         }
-    }
-
-    // TODO: remove this class when sshd use lf->crlf conversion by default
-    public class LfToCrLfFilterOutputStream extends FilterOutputStream {
-
-        private boolean lastWasCr;
-
-        public LfToCrLfFilterOutputStream(OutputStream out) {
-            super(out);
-        }
-
-        @Override
-        public void write(int b) throws IOException {
-            if (!lastWasCr && b == '\n') {
-                out.write('\r');
-                out.write('\n');
-            } else {
-                out.write(b);
-            }
-            lastWasCr = b == '\r';
-        }
-
     }
 
 }

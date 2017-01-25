@@ -52,9 +52,9 @@ import org.apache.karaf.jpm.impl.ScriptUtils;
 import org.apache.karaf.profile.Profile;
 import org.apache.karaf.profile.ProfileBuilder;
 import org.apache.karaf.profile.ProfileService;
+import org.apache.karaf.shell.support.ansi.SimpleAnsi;
 import org.apache.karaf.util.StreamUtils;
 import org.apache.karaf.util.locks.FileLockUtils;
-import org.fusesource.jansi.Ansi;
 import org.osgi.framework.BundleContext;
 import org.osgi.framework.FrameworkUtil;
 import org.osgi.framework.ServiceReference;
@@ -105,6 +105,22 @@ public class InstanceServiceImpl implements InstanceService {
         int defaultRmiRegistryPortStart = 1099;
         int defaultRmiServerPortStart = 44444;
         Map<String, InstanceState> instances;
+        public State() {
+            //read port start value from the root instance configuration
+            try {
+                Properties shellProperty = new Properties();
+                shellProperty.load(new FileInputStream(new File(System.getProperty("karaf.etc"), "org.apache.karaf.shell.cfg")));
+                defaultSshPortStart = Integer.valueOf((String)shellProperty.getOrDefault("sshPort", 8101));
+                Properties managementProperty = new Properties();
+                managementProperty.load(new FileInputStream(new File(System.getProperty("karaf.etc"), "org.apache.karaf.management.cfg")));
+                defaultRmiRegistryPortStart = Integer.valueOf((String)managementProperty.getOrDefault("rmiRegistryPort", 1099));
+                defaultRmiServerPortStart = Integer.valueOf((String)managementProperty.getOrDefault("rmiServerPort", 1099));
+            } catch (Exception e) {
+                LOGGER.debug("Could not read port start value from the root instance configuration.", e);
+            }
+        }
+        
+        
     }
 
     public InstanceServiceImpl() {
@@ -680,10 +696,10 @@ public class InstanceServiceImpl implements InstanceService {
                     throw new IllegalStateException("Instance not stopped");
                 }
 
-                println(Ansi.ansi().a("Renaming instance ")
-                        .a(Ansi.Attribute.INTENSITY_BOLD).a(oldName).a(Ansi.Attribute.RESET)
-                        .a(" to ")
-                        .a(Ansi.Attribute.INTENSITY_BOLD).a(newName).a(Ansi.Attribute.RESET).toString());
+                println("Renaming instance "
+                        + SimpleAnsi.INTENSITY_BOLD + oldName + SimpleAnsi.INTENSITY_NORMAL
+                        + " to "
+                        + SimpleAnsi.INTENSITY_BOLD + newName + SimpleAnsi.INTENSITY_NORMAL);
                 // rename directory
                 String oldLocationPath = instance.loc;
                 File oldLocation = new File(oldLocationPath);
@@ -1085,7 +1101,11 @@ public class InstanceServiceImpl implements InstanceService {
                 InputStream is = getResourceStream(resource, resources);
                 OutputStream os = new FileOutputStream(outFile)
             ) {
-                copyStream(is, os);
+                if (is == null) {
+                    logInfo("\tWARNING: unable to find %s", true, resource);
+                } else {
+                    copyStream(is, os);
+                }
             }
         }
     }

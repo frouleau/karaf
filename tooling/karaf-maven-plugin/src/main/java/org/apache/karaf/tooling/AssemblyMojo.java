@@ -18,11 +18,23 @@
  */
 package org.apache.karaf.tooling;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+
 import org.apache.karaf.profile.assembly.Builder;
 import org.apache.karaf.tooling.utils.IoUtils;
 import org.apache.karaf.tooling.utils.MavenUtil;
 import org.apache.karaf.tooling.utils.MojoSupport;
-import org.apache.karaf.tools.utils.KarafPropertiesEditor;
 import org.apache.karaf.tools.utils.model.KarafPropertyEdits;
 import org.apache.karaf.tools.utils.model.io.stax.KarafPropertyInstructionsModelStaxReader;
 import org.apache.maven.artifact.Artifact;
@@ -32,16 +44,6 @@ import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
-
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.attribute.PosixFilePermissions;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 
 /**
  * Creates a customized Karaf distribution by installing features and setting up
@@ -98,6 +100,9 @@ public class AssemblyMojo extends MojoSupport {
     @Parameter
     private List<String> installedRepositories;
 
+    @Parameter
+    private List<String> blacklistedRepositories;
+
     /**
      * List of features from runtime-scope features xml and kars to be installed into system and listed in startup.properties.
      */
@@ -144,7 +149,7 @@ public class AssemblyMojo extends MojoSupport {
     private List<String> blacklistedProfiles;
 
     @Parameter
-    private Builder.BlacklistPolicy blacklistPolicy;
+    private Builder.BlacklistPolicy blacklistPolicy = Builder.BlacklistPolicy.Discard;
 
     /**
      * Ignore the dependency attribute (dependency="[true|false]") on bundle
@@ -186,6 +191,13 @@ public class AssemblyMojo extends MojoSupport {
     protected String javase;
 
     /**
+     * Specify which framework to use
+     * (one of framework, framework-logback, static-framework, static-framework-logback).
+     */
+    @Parameter
+    protected String framework;
+
+    /**
      * Specify an XML file that instructs this goal to apply edits to
      * one or more standard Karaf property files.
      * The contents of this file are documented in detail on
@@ -224,12 +236,25 @@ public class AssemblyMojo extends MojoSupport {
     protected String propertyFileEdits;
 
     /**
+     * Glob specifying which configuration pids in the selected boot features
+     * should be extracted to the etc directory.
+     */
+    @Parameter
+    protected List<String> pidsToExtract = Collections.singletonList("*");
+
+    /**
      * Specify a set of translated urls to use instead of downloading the artifacts
      * from their original locations.  The given set will be extended with already
      * built artifacts from the maven project.
      */
     @Parameter
     protected Map<String, String> translatedUrls;
+
+    @Parameter
+    protected Map<String, String> config;
+
+    @Parameter
+    protected Map<String, String> system;
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
@@ -260,6 +285,7 @@ public class AssemblyMojo extends MojoSupport {
         bootProfiles = nonNullList(bootProfiles);
         installedProfiles = nonNullList(installedProfiles);
         blacklistedProfiles = nonNullList(blacklistedProfiles);
+        blacklistedRepositories = nonNullList(blacklistedRepositories);
 
         if (!startupProfiles.isEmpty() || !bootProfiles.isEmpty() || !installedProfiles.isEmpty()) {
             if (profilesUri == null) {
@@ -296,10 +322,19 @@ public class AssemblyMojo extends MojoSupport {
         builder.mavenRepositories(remote.toString());
         builder.javase(javase);
 
+        // Set up config and system props
+        if (config != null) {
+            config.forEach(builder::config);
+        }
+        if (system != null) {
+            system.forEach(builder::system);
+        }
+
         // Set up blacklisted items
         builder.blacklistBundles(blacklistedBundles);
         builder.blacklistFeatures(blacklistedFeatures);
         builder.blacklistProfiles(blacklistedProfiles);
+        builder.blacklistRepositories(blacklistedRepositories);
         builder.blacklistPolicy(blacklistPolicy);
 
         if (propertyFileEdits != null) {
@@ -313,6 +348,7 @@ public class AssemblyMojo extends MojoSupport {
                 builder.propertyEdits(edits);
             }
         }
+        builder.pidsToExtract(pidsToExtract);
 
         Map<String, String> urls = new HashMap<>();
         List<Artifact> artifacts = new ArrayList<>(project.getAttachedArtifacts());
@@ -401,6 +437,50 @@ public class AssemblyMojo extends MojoSupport {
             builder.libraries(libraries.toArray(new String[libraries.size()]));
         }
         // Startup
+        boolean hasFrameworkKar = false;
+        for (String kar : startupKars) {
+            if (kar.startsWith("mvn:org.apache.karaf.features/framework/")
+                    || kar.startsWith("mvn:org.apache.karaf.features/static/")) {
+                hasFrameworkKar = true;
+                startupKars.remove(kar);
+                if (framework == null) {
+                    framework = kar.startsWith("mvn:org.apache.karaf.features/framework/")
+                            ? "framework" : "static-framework";
+                }
+                builder.kars(Builder.Stage.Startup, false, kar);
+                break;
+            }
+        }
+        if (!hasFrameworkKar) {
+            Properties versions = new Properties();
+            try (InputStream is = getClass().getResourceAsStream("versions.properties")) {
+                versions.load(is);
+            } catch (IOException e) {
+                throw new IllegalStateException(e);
+            }
+            String realKarafVersion = versions.getProperty("karaf-version");
+            String kar;
+            switch (framework) {
+                case "framework":
+                    kar = "mvn:org.apache.karaf.features/framework/" + realKarafVersion + "/xml/features";
+                    break;
+                case "framework-logback":
+                    kar = "mvn:org.apache.karaf.features/framework/" + realKarafVersion + "/xml/features";
+                    break;
+                case "static-framework":
+                    kar = "mvn:org.apache.karaf.features/static/" + realKarafVersion + "/xml/features";
+                    break;
+                case "static-framework-logback":
+                    kar = "mvn:org.apache.karaf.features/static/" + realKarafVersion + "/xml/features";
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported framework: " + framework);
+            }
+            builder.kars(Builder.Stage.Startup, false, kar);
+        }
+        if (!startupFeatures.contains(framework)) {
+            builder.features(Builder.Stage.Startup, framework);
+        }
         builder.defaultStage(Builder.Stage.Startup)
                .kars(toArray(startupKars))
                .repositories(startupFeatures.isEmpty() && startupProfiles.isEmpty() && installAllFeaturesByDefault, toArray(startupRepositories))

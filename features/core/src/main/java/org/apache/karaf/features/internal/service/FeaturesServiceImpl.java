@@ -110,10 +110,11 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
     private static final String FEATURE_OSGI_REQUIREMENT_PREFIX = "feature:";
 
     /**
-     * Our bundle.
+     * Our bundle and corresponding bundle context.
      * We use it to check bundle operations affecting our own bundle.
      */
     private final Bundle bundle;
+    private final BundleContext bundleContext;
 
     /**
      * The system bundle context.
@@ -180,9 +181,11 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
     private final Object lock = new Object();
     private final State state = new State();
     private final Map<String, Repository> repositoryCache = new HashMap<>();
+    private final ExecutorService executor;
     private Map<String, Map<String, Feature>> featureCache;
 
     public FeaturesServiceImpl(Bundle bundle,
+                               BundleContext bundleContext,
                                BundleContext systemBundleContext,
                                StateStorage storage,
                                FeatureFinder featureFinder,
@@ -200,31 +203,14 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                                long scheduleDelay,
                                int scheduleMaxRun,
                                String blacklisted) {
-        this.bundle = bundle;
-        this.systemBundleContext = systemBundleContext;
-        this.storage = storage;
-        this.featureFinder = featureFinder;
-        this.eventAdminListener = eventAdminListener;
-        this.configurationAdmin = configurationAdmin;
-        this.resolver = resolver;
-        this.configInstaller = configurationAdmin != null ? new FeatureConfigInstaller(configurationAdmin, FeaturesService.DEFAULT_CONFIG_CFG_STORE) : null;
-        this.digraph = digraph;
-        this.overrides = overrides;
-        this.featureResolutionRange = featureResolutionRange;
-        this.bundleUpdateRange = bundleUpdateRange;
-        this.updateSnaphots = updateSnaphots;
-        this.serviceRequirements = serviceRequirements;
-        this.globalRepository = globalRepository;
-        this.downloadThreads = downloadThreads > 0 ? downloadThreads : 1;
-        this.scheduleDelay = scheduleDelay;
-        this.scheduleMaxRun = scheduleMaxRun;
-        this.blacklisted = blacklisted;
-        this.configCfgStore = FeaturesService.DEFAULT_CONFIG_CFG_STORE;
-        loadState();
-        checkResolve();
+        this(bundle, bundleContext,systemBundleContext, storage, featureFinder, eventAdminListener, configurationAdmin,
+                resolver, digraph, overrides, featureResolutionRange, bundleUpdateRange, updateSnaphots,
+                serviceRequirements, globalRepository, downloadThreads, scheduleDelay, scheduleMaxRun, blacklisted,
+                FeaturesService.DEFAULT_CONFIG_CFG_STORE);
     }
 
     public FeaturesServiceImpl(Bundle bundle,
+                               BundleContext bundleContext,
                                BundleContext systemBundleContext,
                                StateStorage storage,
                                FeatureFinder featureFinder,
@@ -244,6 +230,7 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                                String blacklisted,
                                boolean configCfgStore) {
         this.bundle = bundle;
+        this.bundleContext = bundleContext;
         this.systemBundleContext = systemBundleContext;
         this.storage = storage;
         this.featureFinder = featureFinder;
@@ -263,16 +250,24 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
         this.scheduleMaxRun = scheduleMaxRun;
         this.blacklisted = blacklisted;
         this.configCfgStore = configCfgStore;
+        this.executor = Executors.newSingleThreadExecutor();
         loadState();
         checkResolve();
     }
 
-    @SuppressWarnings("unchecked")
+    @SuppressWarnings({
+     "unchecked", "rawtypes"
+    })
+    public void stop() {
+      this.executor.shutdown();
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
     private void checkResolve() {
-        if (bundle == null) {
+        if (bundleContext == null) {
             return; // Most certainly in unit tests
         }
-        File resolveFile = bundle.getBundleContext().getDataFile("resolve");
+        File resolveFile = bundleContext.getDataFile("resolve");
         if (!resolveFile.exists()) {
             return;
         }
@@ -301,7 +296,7 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
     }
 
     private void writeResolve(Map<String, Set<String>> requestedFeatures, EnumSet<Option> options) throws IOException {
-        File resolveFile = bundle.getBundleContext().getDataFile("resolve");
+        File resolveFile = bundleContext.getDataFile("resolve");
         Map<String, Object> request = new HashMap<>();
         List<String> opts = new ArrayList<>();
         for (Option opt : options) {
@@ -340,8 +335,8 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                     state.bundleChecksums.clear();
                 }
                 storage.save(state);
-                if (bundle != null) { // For tests, this should never happen at runtime
-                    DigraphHelper.saveDigraph(bundle.getBundleContext(), digraph);
+                if (bundleContext != null) { // For tests, this should never happen at runtime
+                    DigraphHelper.saveDigraph(bundleContext, digraph);
                 }
             }
         } catch (IOException e) {
@@ -449,10 +444,6 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
 
     @Override
     public void addRepository(URI uri, boolean install) throws Exception {
-        if (install) {
-            // TODO: implement
-            throw new UnsupportedOperationException();
-        }
         Repository repository = loadRepository(uri);
         synchronized (lock) {
             // Clean cache
@@ -465,6 +456,14 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
             saveState();
         }
         callListeners(new RepositoryEvent(repository, RepositoryEvent.EventType.RepositoryAdded, false));
+        // install the features in the repo
+        if (install) {
+            HashSet<String> features = new HashSet<>();
+            for (Feature feature : repository.getFeatures()) {
+                features.add(feature.getName() + "/" + feature.getVersion());
+            }
+            installFeatures(features, EnumSet.noneOf(FeaturesService.Option.class));
+        }
     }
 
     @Override
@@ -474,8 +473,27 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
 
     @Override
     public void removeRepository(URI uri, boolean uninstall) throws Exception {
-        // TODO: check we don't have any feature installed from this repository
-        Repository repo;
+        Repository repo = getRepository(uri);
+        if (repo == null) {
+            return;
+        }
+
+        Set<String> features = new HashSet<>();
+        synchronized (lock) {
+            for (Feature feature : repo.getFeatures()) {
+                if (isRequired(feature)) {
+                    features.add(feature.getId());
+                }
+            }
+        }
+        if (!features.isEmpty()) {
+            if (uninstall) {
+                uninstallFeatures(features, EnumSet.noneOf(Option.class));
+            } else {
+                throw new IllegalStateException("The following features are required from the repository: " + String.join(", ", features));
+            }
+        }
+
         synchronized (lock) {
             // Remove repo
             if (!state.repositories.remove(uri.toString())) {
@@ -495,9 +513,6 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                 }
             }
             saveState();
-        }
-        if (repo == null) {
-            repo = new RepositoryImpl(uri, blacklisted);
         }
         callListeners(new RepositoryEvent(repo, RepositoryEvent.EventType.RepositoryRemoved, false));
     }
@@ -669,6 +684,7 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
         Map<String, Map<String, Feature>> map = new HashMap<>();
         // Two phase load:
         // * first load dependent repositories
+        Set<String> loaded = new HashSet<>();
         List<String> toLoad = new ArrayList<>(uris);
         while (!toLoad.isEmpty()) {
             String uri = toLoad.remove(0);
@@ -685,8 +701,10 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                         repositoryCache.put(uri, repo);
                     }
                 }
-                for (URI u : repo.getRepositories()) {
-                    toLoad.add(u.toString());
+                if (loaded.add(uri)) {
+                    for (URI u : repo.getRepositories()) {
+                        toLoad.add(u.toString());
+                    }
                 }
             } catch (Exception e) {
                     LOGGER.warn("Can't load features repository {}", uri, e);
@@ -812,7 +830,7 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
 
     @Override
     public void installFeature(Feature feature, EnumSet<Option> options) throws Exception {
-        installFeature(feature.getId());
+        installFeature(feature.getId(), options);
     }
 
     @Override
@@ -890,7 +908,7 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                         Feature[] installedFeatures = listInstalledFeatures();
                         for (int i=0;i<installedFeatures.length;i++) {
                             if (installedFeatures[i].getName().equals(f.getName()) && installedFeatures[i].getVersion().equals(f.getVersion())) {
-                                System.out.println("The specified feature: '" + installedFeatures[i].getName() + "' version '" + installedFeatures[i].getVersion() + "' is already installed");
+                                LOGGER.info("The specified feature: '{}' version '{}' {}",f.getName(),f.getVersion(),f.getVersion().endsWith("SNAPSHOT") ? "has been upgraded": "is already installed");
                             }
                         }
                         matched = true;
@@ -1044,16 +1062,12 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
                                     final Map<String, Map<String, FeatureState>> stateChanges,
                                     final State state,
                                     final EnumSet<Option> options) throws Exception {
-        ExecutorService executor = Executors.newCachedThreadPool();
         try {
             final String outputFile = this.outputFile.get();
             this.outputFile.set(null);
-            executor.submit(new Callable<Object>() {
-                @Override
-                public Object call() throws Exception {
-                    doProvision(requirements, stateChanges, state, options, outputFile);
-                    return null;
-                }
+            executor.submit(() -> {
+                doProvision(requirements, stateChanges, state, options, outputFile);
+                return null;
             }).get();
         } catch (ExecutionException e) {
             Throwable t = e.getCause();
@@ -1066,8 +1080,6 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
             } else {
                 throw e;
             }
-        } finally {
-            executor.shutdown();
         }
     }
 
@@ -1265,7 +1277,9 @@ public class FeaturesServiceImpl implements FeaturesService, Deployer.DeployCall
 
     @Override
     public void startBundle(Bundle bundle) throws BundleException {
-        bundle.start();
+        if (bundle != this.bundle || bundle.getState() != Bundle.STARTING) {
+            bundle.start();
+        }
     }
 
     @Override

@@ -169,7 +169,6 @@
                         <feature>eventadmin</feature>
                     </startupFeatures>
                     <bootFeatures>
-                        <feature>framework</feature>
                         <feature>wrap</feature>
                         <feature>aries-blueprint</feature>
                         <feature>shell</feature>
@@ -191,8 +190,7 @@
                         <feature>system</feature>
                     </bootFeatures>
                     <libraries>
-                        <library>xerces-${xerces.version}.jar;url:="wrap:mvn:xerces/xercesImpl/${xerces.version}$Export-Package=org.apache.*;version=${xerces.version}";type:=endorsed;export:=true;delegate:=true</library>
-
+                        <library>mvn:org.apache.servicemix.bundles/org.apache.servicemix.bundles.xerces/${xerces.version};type:=endorsed;export:=true;delegate:=true</library>
                         <library>mvn:org.apache.servicemix.specs/org.apache.servicemix.specs.jaxp-api-1.4/${servicemix.specs.version};type:=endorsed;export:=true</library>
                         <library>mvn:org.apache.servicemix.specs/org.apache.servicemix.specs.jaxb-api-2.2/${servicemix.specs.version};type:=endorsed;export:=true</library>
                         <library>mvn:org.apache.servicemix.specs/org.apache.servicemix.specs.jaxws-api-2.2/${servicemix.specs.version};type:=endorsed;export:=true</library>
@@ -205,7 +203,11 @@
 
                         <library>mvn:org.apache.servicemix.specs/org.apache.servicemix.specs.activator/${servicemix.specs.version};type:=default;export:=true</library>
                         <library>mvn:org.apache.servicemix.specs/org.apache.servicemix.specs.locator/${servicemix.specs.version};type:=default;export:=true</library>
+
+                        <library>mvn:net.java.dev.jna/jna/${jna.version};type:=boot;export:=false</library>
+                        <library>mvn:net.java.dev.jna/jna-platform/${jna.version};type:=boot;export:=false</library>
                     </libraries>
+                    <javase>1.8</javase>
                 </configuration>
             </plugin>
         </plugins>

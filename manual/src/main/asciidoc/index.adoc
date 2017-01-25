@@ -36,7 +36,7 @@ include::user-guide/directory-structure.adoc[]
 
 include::user-guide/start-stop.adoc[]
 
-include::user-guide/wrapper.adoc[]
+include::user-guide/os-integration.adoc[]
 
 include::user-guide/console.adoc[]
 
@@ -44,7 +44,7 @@ include::user-guide/remote.adoc[]
 
 include::user-guide/log.adoc[]
 
-include::user-guide/configugration.adoc[]
+include::user-guide/configuration.adoc[]
 
 include::user-guide/urls.adoc[]
 

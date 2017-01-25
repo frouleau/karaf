@@ -20,7 +20,7 @@
 # handle specific scripts; the SCRIPT_NAME is exactly the name of the Karaf
 # script: client, instance, shell, start, status, stop, karaf
 #
-# if [ "$KARAF_SCRIPT" == "SCRIPT_NAME" ]; then
+# if [ "${KARAF_SCRIPT}" == "SCRIPT_NAME" ]; then
 #   Actions go here...
 # fi
 
@@ -48,4 +48,4 @@
 # export KARAF_OPTS # Additional available Karaf options
 # export KARAF_DEBUG # Enable debug mode
 # export KARAF_REDIRECT # Enable/set the std/err redirection when using bin/start
-
+# export KARAF_NOROOT # Prevent execution as root if set to true

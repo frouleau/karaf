@@ -130,6 +130,19 @@ public class Deployer {
         void replaceDigraph(Map<String, Map<String,Map<String,Set<String>>>> policies, Map<String, Set<Long>> bundles) throws BundleException, InvalidSyntaxException;
     }
 
+    public static class CircularPrerequisiteException extends Exception {
+        private final Set<String> prereqs;
+
+        public CircularPrerequisiteException(Set<String> prereqs) {
+            super(prereqs.toString());
+            this.prereqs = prereqs;
+        }
+
+        public Set<String> getPrereqs() {
+            return prereqs;
+        }
+    }
+
     public static class PartialDeploymentException extends Exception {
         private final Set<String> missing;
 
@@ -249,6 +262,9 @@ public class Deployer {
             }
         }
         if (!prereqs.isEmpty()) {
+            if (request.requirements.get(ROOT_REGION).containsAll(prereqs)) {
+                throw new CircularPrerequisiteException(prereqs);
+            }
             DeploymentRequest newRequest = new DeploymentRequest();
             newRequest.bundleUpdateRange = request.bundleUpdateRange;
             newRequest.featureResolutionRange = request.featureResolutionRange;
@@ -443,10 +459,24 @@ public class Deployer {
                 propagateState(states, feature, FeatureState.Started, resolver);
             }
         }
-        // Put default Started state for other bundles
+        // Put default Started state for other bundles if start attribute is true
         for (Resource resource : resolver.getBundles().keySet()) {
-            if (!states.containsKey(resource)) {
-                states.put(resource, FeatureState.Started);
+            BundleInfo bundleInfo = null;
+            for (Map.Entry<String, Map<String, BundleInfo>> bis : resolver.getBundleInfos().entrySet()) {
+                bundleInfo = bis.getValue().get(getUri(resource));
+            }
+            Bundle bundle = deployment.resToBnd.get(resource);
+            if (bundle == null) {
+                // bundle is not present, it's provided by feature
+                // we are using bundleInfo and start flag
+                if (bundleInfo != null && bundleInfo.isStart()) {
+                    states.put(resource, FeatureState.Started);
+                } else {
+                    states.put(resource, FeatureState.Resolved);
+                }
+            } else {
+                // if the bundle is already there, just ignore changing state by feature
+                states.remove(resource);
             }
         }
         // Only keep bundles resources
@@ -558,7 +588,8 @@ public class Deployer {
         //  - start the bundle
         //  - exit
         // When restarting, the resolution will be attempted again
-        if (rootRegionDeployment != null && rootRegionDeployment.toUpdate.containsKey(dstate.serviceBundle)) {
+        if (rootRegionDeployment != null && rootRegionDeployment.toUpdate.containsKey(dstate.serviceBundle)
+            ) {
             callback.persistResolveRequest(request);
             // If the bundle is updated because of a different checksum,
             // save the new checksum persistently
@@ -723,6 +754,7 @@ public class Deployer {
         }
         if (hasToInstall) {
             print("Installing bundles:", verbose);
+            Map<Bundle, Integer> customStartLevels = new HashMap<Bundle, Integer>();
             for (Map.Entry<String, Deployer.RegionDeployment> entry : deployment.regions.entrySet()) {
                 String name = entry.getKey();
                 Deployer.RegionDeployment regionDeployment = entry.getValue();
@@ -746,7 +778,7 @@ public class Deployer {
                     }
                     Integer startLevel = startLevels.get(resource);
                     if (startLevel != null && startLevel != dstate.initialBundleStartLevel) {
-                        callback.setBundleStartLevel(bundle, startLevel);
+                        customStartLevels.put(bundle, startLevel);
                     }
                     FeatureState reqState = states.get(resource);
                     if (reqState == null) {
@@ -762,6 +794,11 @@ public class Deployer {
                         break;
                     }
                 }
+            }
+            
+            // Set start levels after install to avoid starting before all bundles are installed
+            for (Bundle bundle : customStartLevels.keySet()) {
+                callback.setBundleStartLevel(bundle, customStartLevels.get(bundle));
             }
         }
 
@@ -940,7 +977,12 @@ public class Deployer {
             for (Resource res : resolution.keySet()) {
                 for (Wire wire : resolution.get(res)) {
                     if (HOST_NAMESPACE.equals(wire.getCapability().getNamespace())) {
-                        Bundle bundle = resources.get(wire.getProvider());
+                        Bundle bundle;
+                        if (wire.getProvider() instanceof BundleRevision) {
+                            bundle = ((BundleRevision) wire.getProvider()).getBundle();
+                        } else {
+                            bundle = resources.get(wire.getProvider());
+                        }
                         if (bundle != null) {
                             Bundle b = resources.get(wire.getRequirer());
                             Resource r = b != null ? b.adapt(BundleRevision.class) : wire.getRequirer();
@@ -985,7 +1027,7 @@ public class Deployer {
                         oldFragments.add(wire.getRequirer());
                     }
                 }
-                if (!oldFragments.equals(newFragments.get(bundle))) {
+                if (!oldFragments.containsAll(newFragments.get(bundle))) {
                     toRefresh.put(bundle, "Attached fragments changed: " + new ArrayList<>(newFragments.get(bundle)));
                     break;
                 }
@@ -1200,7 +1242,7 @@ public class Deployer {
                                     // corresponding jar url and use that one to compute the checksum of the bundle.
                                     oldCrc = 0l;
                                     try {
-                                        URL url = bundle.getResource("META-INF/MANIFEST.MF");
+                                        URL url = bundle.getEntry("META-INF/MANIFEST.MF");
                                         URLConnection con = url.openConnection();
                                         Method method = con.getClass().getDeclaredMethod("getLocalURL");
                                         method.setAccessible(true);
@@ -1370,7 +1412,7 @@ public class Deployer {
         if (!bundlesToDestroy.isEmpty()) {
             Collections.sort(bundlesToDestroy, new Comparator<Bundle>() {
                 public int compare(Bundle b1, Bundle b2) {
-                    return (int) (b2.getLastModified() - b1.getLastModified());
+                    return Long.compare(b2.getLastModified(), b1.getLastModified());
                 }
             });
             LOGGER.debug("Selected bundles {} for destroy (no services in use)", bundlesToDestroy);

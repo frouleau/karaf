@@ -20,12 +20,14 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.net.*;
 import java.util.Map;
 
 import org.apache.felix.resolver.ResolverImpl;
 import org.apache.karaf.features.Feature;
 import org.apache.karaf.features.TestBase;
-import org.apache.karaf.features.Slf4jResolverLog;
+import org.apache.karaf.features.internal.resolver.Slf4jResolverLog;
 import org.junit.Before;
 import org.junit.Test;
 import org.osgi.service.resolver.Resolver;
@@ -54,7 +56,7 @@ public class FeaturesServiceImplTest extends TestBase {
     public void testGetFeature() throws Exception {
         Feature transactionFeature = feature("transaction", "1.0.0");
         final Map<String, Map<String, Feature>> features = features(transactionFeature);
-        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
+        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
             protected Map<String,Map<String,Feature>> getFeatures() throws Exception {
                 return features;
             }
@@ -65,7 +67,7 @@ public class FeaturesServiceImplTest extends TestBase {
     
     @Test
     public void testGetFeatureStripVersion() throws Exception {
-        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
+        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
             protected Map<String,Map<String,Feature>> getFeatures() throws Exception {
                 return features(feature("transaction", "1.0.0"));
             }
@@ -79,7 +81,7 @@ public class FeaturesServiceImplTest extends TestBase {
     
     @Test
     public void testGetFeatureNotAvailable() throws Exception {
-        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
+        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
             protected Map<String,Map<String,Feature>> getFeatures() throws Exception {
                 return features(feature("transaction", "1.0.0"));
             }
@@ -93,13 +95,32 @@ public class FeaturesServiceImplTest extends TestBase {
                 feature("transaction", "1.0.0"),
                 feature("transaction", "2.0.0")
         );
-        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
+        final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null) {
             protected Map<String,Map<String,Feature>> getFeatures() throws Exception {
                 return features;
             }
         };
         assertNotNull(impl.getFeatures("transaction", org.apache.karaf.features.internal.model.Feature.DEFAULT_VERSION));
         assertEquals("2.0.0", impl.getFeatures("transaction", org.apache.karaf.features.internal.model.Feature.DEFAULT_VERSION)[0].getVersion());
+    }
+
+    @Test
+    public void testCyclicFeatures() throws Exception {
+        URL.setURLStreamHandlerFactory(protocol -> protocol.equals("custom") ? new URLStreamHandler() {
+            @Override
+            protected URLConnection openConnection(URL u) throws IOException {
+                return getClass().getResource(u.getPath()).openConnection();
+            }
+        } : null);
+        try {
+            final FeaturesServiceImpl impl = new FeaturesServiceImpl(null, null, null, new Storage(), null, null, null, this.resolver, null, "", null, null, null, null, null, 0, 0, 0, null);
+            impl.addRepository(URI.create("custom:cycle/a-references-b.xml"));
+            impl.getFeatures();
+        } finally {
+            Field field = URL.class.getDeclaredField("factory");
+            field.setAccessible(true);
+            field.set(null, null);
+        }
     }
 
     /**

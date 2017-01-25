@@ -122,7 +122,6 @@
                         <feature>wrapper</feature>
                     </installedFeatures>
                     <bootFeatures>
-                        <feature>framework</feature>
                         <feature>jaas</feature>
                         <feature>shell</feature>
                         <feature>feature</feature>
@@ -139,6 +138,12 @@
                         <feature>service</feature>
                         <feature>system</feature>
                     </bootFeatures>
+                    <pidsToExtract>
+                        !jmx.acl.*,
+                        !org.apache.karaf.command.acl.*,
+                        *
+                    </pidsToExtract>
+                    <javase>1.8</javase>
                 </configuration>
             </plugin>
 

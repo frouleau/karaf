@@ -16,12 +16,23 @@ package org.apache.karaf.itests.features;
 import org.apache.karaf.itests.KarafTestSupport;
 import org.apache.karaf.itests.util.RunIfRules.RunIfNotOnJdk8;
 import org.apache.karaf.itests.util.RunIfRule;
+
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+
+import org.ops4j.pax.exam.Configuration;
+import org.ops4j.pax.exam.MavenUtils;
+import org.ops4j.pax.exam.Option;
 import org.ops4j.pax.exam.junit.PaxExam;
 import org.ops4j.pax.exam.spi.reactors.ExamReactorStrategy;
 import org.ops4j.pax.exam.spi.reactors.PerClass;
+
+import java.util.Arrays;
+import java.util.LinkedList;
+import java.util.List;
+
+import static org.ops4j.pax.exam.karaf.options.KarafDistributionOption.editConfigurationFilePut;
 
 @RunWith(PaxExam.class)
 @ExamReactorStrategy(PerClass.class)
@@ -30,9 +41,23 @@ public class EnterpriseFeaturesTest extends KarafTestSupport {
     @Rule
     public RunIfRule rule = new RunIfRule();
 
+    @Configuration
+    public Option[] config() {
+        String version = MavenUtils.getArtifactVersion("org.apache.karaf", "apache-karaf");
+        List<Option> result = new LinkedList<>(Arrays.asList(super.config()));
+        result.add(editConfigurationFilePut("etc/org.apache.karaf.features.cfg", "featuresRepositories",
+                        "mvn:org.apache.karaf.features/framework/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/spring/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/spring-legacy/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/enterprise/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/enterprise-legacy/" + version + "/xml/features, " +
+                        "mvn:org.apache.karaf.features/standard/" + version + "/xml/features"));
+        return result.toArray(new Option[result.size()]);
+    }
+
     @Test
     public void installTransaction130Feature() throws Exception {
-        installAssertAndUninstallFeature("transaction", "1.3.0");
+        installAssertAndUninstallFeature("transaction", "1.3.2");
     }
 
     @Test
@@ -64,11 +89,6 @@ public class EnterpriseFeaturesTest extends KarafTestSupport {
     @Test
     public void installOpenJpa240Feature() throws Exception {
         installAssertAndUninstallFeature("openjpa", "2.4.1");
-    }
-
-    @Test
-    public void installHibernate332GAFeature() throws Exception {
-        installAssertAndUninstallFeature("hibernate", "3.3.2.GA");
     }
 
     @Test

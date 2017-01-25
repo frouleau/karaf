@@ -39,12 +39,15 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.jar.Attributes;
 import java.util.jar.Manifest;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -52,6 +55,8 @@ import org.apache.felix.resolver.ResolverImpl;
 import org.apache.felix.utils.manifest.Clause;
 import org.apache.felix.utils.properties.InterpolationHelper;
 import org.apache.felix.utils.properties.Properties;
+import org.apache.felix.utils.version.VersionRange;
+import org.apache.felix.utils.version.VersionTable;
 import org.apache.karaf.features.FeaturesService;
 import org.apache.karaf.features.Library;
 import org.apache.karaf.features.internal.download.DownloadCallback;
@@ -61,6 +66,7 @@ import org.apache.karaf.features.internal.download.StreamProvider;
 import org.apache.karaf.features.internal.download.impl.DownloadManagerHelper;
 import org.apache.karaf.features.internal.model.Bundle;
 import org.apache.karaf.features.internal.model.Conditional;
+import org.apache.karaf.features.internal.model.Config;
 import org.apache.karaf.features.internal.model.ConfigFile;
 import org.apache.karaf.features.internal.model.Dependency;
 import org.apache.karaf.features.internal.model.Feature;
@@ -76,13 +82,13 @@ import org.apache.karaf.profile.Profile;
 import org.apache.karaf.profile.ProfileBuilder;
 import org.apache.karaf.profile.impl.Profiles;
 import org.apache.karaf.tools.utils.KarafPropertiesEditor;
-import org.apache.karaf.tools.utils.model.KarafPropertyEdit;
 import org.apache.karaf.tools.utils.model.KarafPropertyEdits;
 import org.apache.karaf.util.config.PropertiesLoader;
 import org.apache.karaf.util.maven.Parser;
 import org.ops4j.pax.url.mvn.MavenResolver;
 import org.ops4j.pax.url.mvn.MavenResolvers;
 import org.osgi.framework.Constants;
+import org.osgi.framework.Version;
 import org.osgi.framework.wiring.BundleRevision;
 import org.osgi.resource.Resource;
 import org.osgi.service.resolver.Resolver;
@@ -90,6 +96,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static java.util.jar.JarFile.MANIFEST_NAME;
+import static org.apache.karaf.features.internal.service.Blacklist.TYPE_REPOSITORY;
 import static org.apache.karaf.profile.assembly.Builder.Stage.Startup;
 
 public class Builder {
@@ -106,16 +113,16 @@ public class Builder {
     private static final String LIBRARY_CLAUSE_DELEGATE = "delegate";
     public static final String ORG_OPS4J_PAX_URL_MVN_PID = "org.ops4j.pax.url.mvn";
 
-    public static enum Stage {
+    public enum Stage {
         Startup, Boot, Installed
     }
 
-    public static enum KarafVersion {
+    public enum KarafVersion {
         v24, v3x, v4x
     }
 
 
-    public static enum BlacklistPolicy {
+    public enum BlacklistPolicy {
         Discard,
         Fail
     }
@@ -140,6 +147,7 @@ public class Builder {
     List<String> blacklistedProfiles = new ArrayList<>();
     List<String> blacklistedFeatures = new ArrayList<>();
     List<String> blacklistedBundles = new ArrayList<>();
+    List<String> blacklistedRepositories = new ArrayList<>();
     BlacklistPolicy blacklistPolicy = BlacklistPolicy.Discard;
     List<String> libraries = new ArrayList<>();
     String javase = "1.7";
@@ -152,6 +160,9 @@ public class Builder {
     boolean offline;
     String localRepository;
     String mavenRepositories;
+    Map<String, String> config = new LinkedHashMap<>();
+    Map<String, String> system = new LinkedHashMap<>();
+    List<String> pidsToExtract;
 
     private ScheduledExecutorService executor;
     private DownloadManager manager;
@@ -348,6 +359,11 @@ public class Builder {
         return this;
     }
 
+    public Builder blacklistRepositories(Collection<String> repositories) {
+        this.blacklistedRepositories.addAll(repositories);
+        return this;
+    }
+
     public Builder blacklistPolicy(BlacklistPolicy policy) {
         this.blacklistPolicy = policy;
         return this;
@@ -363,6 +379,11 @@ public class Builder {
         return this;
     }
 
+    public Builder pidsToExtract(List<String> pidsToExtract) {
+        this.pidsToExtract = pidsToExtract;
+        return this;
+    }
+
     /**
      * Specify a set of url mappings to use instead of
      * downloading from the original urls.
@@ -371,6 +392,16 @@ public class Builder {
      */
     public Builder translatedUrls(Map<String, String> translatedUrls) {
         this.translatedUrls = translatedUrls;
+        return this;
+    }
+
+    public Builder config(String key, String value) {
+        this.config.put(key, value);
+        return this;
+    }
+
+    public Builder system(String key, String value) {
+        this.system.put(key, value);
         return this;
     }
 
@@ -386,8 +417,16 @@ public class Builder {
         return blacklistedBundles;
     }
 
+    public List<String> getBlacklistedRepositories() {
+        return blacklistedRepositories;
+    }
+
     public BlacklistPolicy getBlacklistPolicy() {
         return blacklistPolicy;
+    }
+
+    public List<String> getPidsToExtract() {
+        return pidsToExtract;
     }
 
     public void generateAssembly() throws Exception {
@@ -486,7 +525,7 @@ public class Builder {
                 profilePath = Paths.get(profileURI);
             } catch (FileSystemNotFoundException e) {
                 // file system does not exist, try to create it
-                FileSystem fs = FileSystems.newFileSystem(profileURI, new HashMap<String, Object>(), Builder.class.getClassLoader());
+                FileSystem fs = FileSystems.newFileSystem(profileURI, new HashMap<>(), Builder.class.getClassLoader());
                 profilePath = fs.provider().getPath(profileURI);
             }
             allProfiles.putAll(Profiles.loadProfiles(profilePath));
@@ -506,14 +545,18 @@ public class Builder {
 
         // Generate profiles
         Profile startupProfile = generateProfile(Stage.Startup, profiles, repositories, features, bundles);
+        profiles.put(startupProfile.getId(), Stage.Boot);
         Profile bootProfile = generateProfile(Stage.Boot, profiles, repositories, features, bundles);
         Profile installedProfile = generateProfile(Stage.Installed, profiles, repositories, features, bundles);
 
         //
         // Compute overall profile
         //
-        Profile overallProfile = ProfileBuilder.Factory.create(UUID.randomUUID().toString())
-                .setParents(Arrays.asList(startupProfile.getId(), bootProfile.getId(), installedProfile.getId()))
+        ProfileBuilder builder = ProfileBuilder.Factory.create(UUID.randomUUID().toString())
+                .setParents(Arrays.asList(startupProfile.getId(), bootProfile.getId(), installedProfile.getId()));
+        config.forEach((k ,v) -> builder.addConfiguration(Profile.INTERNAL_PID, Profile.CONFIG_PREFIX + k, v));
+        system.forEach((k ,v) -> builder.addConfiguration(Profile.INTERNAL_PID, Profile.SYSTEM_PREFIX + k, v));
+        Profile overallProfile = builder
                 .getProfile();
         Profile overallOverlay = Profiles.getOverlay(overallProfile, allProfiles, environment);
         Profile overallEffective = Profiles.getEffective(overallOverlay, false);
@@ -523,14 +566,7 @@ public class Builder {
         Hashtable<String, String> agentProps = new Hashtable<>(overallEffective.getConfiguration(ORG_OPS4J_PAX_URL_MVN_PID));
         final Map<String, String> properties = new HashMap<>();
         properties.put("karaf.default.repository", "system");
-        InterpolationHelper.performSubstitution(agentProps, new InterpolationHelper.SubstitutionCallback() {
-            @Override
-            public String getValue(String key) {
-                return properties.get(key);
-            }
-        }, false, false, true);
-
-        Map<String, List<KarafPropertyEdit>> editsByFile = new HashMap<>();
+        InterpolationHelper.performSubstitution(agentProps, properties::get, false, false, true);
 
         //
         // Write config and system properties
@@ -551,8 +587,8 @@ public class Builder {
         // TODO: handle karaf 2.x and 3.x libraries
         LOGGER.info("Downloading libraries");
         downloader = manager.createDownloader();
-        downloadLibraries(downloader, configProperties, overallEffective.getLibraries());
-        downloadLibraries(downloader, configProperties, libraries);
+        downloadLibraries(downloader, configProperties, overallEffective.getLibraries(), "");
+        downloadLibraries(downloader, configProperties, libraries, "");
         downloader.await();
         // Reformat clauses
         reformatClauses(configProperties, Constants.FRAMEWORK_SYSTEMPACKAGES_EXTRA);
@@ -562,8 +598,10 @@ public class Builder {
         //
         // Write all configuration files
         //
+        LOGGER.info("Writing configurations");
         for (Map.Entry<String, byte[]> config : overallEffective.getFileConfigurations().entrySet()) {
             Path configFile = etcDirectory.resolve(config.getKey());
+            LOGGER.info("   adding config file: {}", homeDirectory.relativize(configFile));
             Files.createDirectories(configFile.getParent());
             Files.write(configFile, config.getValue());
         }
@@ -587,6 +625,7 @@ public class Builder {
             lines.add("# Generated by the karaf assembly builder");
             lines.add("#");
             lines.addAll(overallEffective.getOverrides());
+            LOGGER.info("Generating {}", homeDirectory.relativize(overrides));
             Files.write(overrides, lines, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         }
 
@@ -609,6 +648,7 @@ public class Builder {
                 lines.add("# Bundles");
                 lines.addAll(blacklistedBundles);
             }
+            LOGGER.info("Generating {}", homeDirectory.relativize(blacklist));
             Files.write(blacklist, lines, StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
         }
 
@@ -651,7 +691,7 @@ public class Builder {
         }
     }
 
-    protected void downloadLibraries(Downloader downloader, final Properties config, Collection<String> libraries) throws MalformedURLException {
+    void downloadLibraries(Downloader downloader, final Properties config, Collection<String> libraries, String indent) throws MalformedURLException {
         Clause[] clauses = org.apache.felix.utils.manifest.Parser.parseClauses(libraries.toArray(new String[libraries.size()]));
         for (final Clause clause : clauses) {
             final String filename;
@@ -672,15 +712,14 @@ public class Builder {
             case Library.TYPE_BOOT:      path = "lib/boot"; break;
             default:                     path = "lib"; break;
             }
-            downloader.download(library, new DownloadCallback() {
-                @Override
-                public void downloaded(final StreamProvider provider) throws Exception {
+            downloader.download(library, provider -> {
                     synchronized (provider) {
                         Path input = provider.getFile().toPath();
                         String name = filename != null ? filename : input.getFileName().toString();
+                        Path libOutput = homeDirectory.resolve(path).resolve(name);
+                        LOGGER.info("{}   adding library: {}", indent, homeDirectory.relativize(libOutput));
+                        Files.copy(input, libOutput, StandardCopyOption.REPLACE_EXISTING);
                         if (provider.getUrl().startsWith("mvn:")) {
-                            Path libOutput = homeDirectory.resolve(path).resolve(name);
-                            Files.copy(input, libOutput, StandardCopyOption.REPLACE_EXISTING);
                             // copy boot library in system repository
                             if (type.equals(Library.TYPE_BOOT)) {
                                 String mvnPath = Parser.pathFromMaven(provider.getUrl());
@@ -689,6 +728,7 @@ public class Builder {
                                 Files.copy(input, sysOutput, StandardCopyOption.REPLACE_EXISTING);
                                 libOutput = homeDirectory.resolve(path).resolve(name);
                                 // copy the file
+                                LOGGER.info("{}   adding maven library: {}", indent, provider.getUrl());
                                 Files.copy(input, libOutput, StandardCopyOption.REPLACE_EXISTING);
                                 /* a symlink could be used instead
 
@@ -701,9 +741,6 @@ public class Builder {
                                 }
                                 */
                             }
-                        } else {
-                            Path output = homeDirectory.resolve(path).resolve(name);
-                            Files.copy(input, output, StandardCopyOption.REPLACE_EXISTING);
                         }
                     }
                     boolean export = Boolean.parseBoolean(clause.getDirective(LIBRARY_CLAUSE_EXPORT));
@@ -712,29 +749,29 @@ public class Builder {
                         Map<String, String> headers = getHeaders(provider);
                         String packages = headers.get(Constants.EXPORT_PACKAGE);
                         if (packages != null) {
-                            Clause[] clauses = org.apache.felix.utils.manifest.Parser.parseHeader(packages);
+                            Clause[] clauses1 = org.apache.felix.utils.manifest.Parser.parseHeader(packages);
                             if (export) {
                                 String val = config.getProperty(Constants.FRAMEWORK_SYSTEMPACKAGES_EXTRA);
-                                for (Clause clause : clauses) {
-                                    val += "," + clause.toString();
+                                for (Clause clause1 : clauses1) {
+                                    val += "," + clause1.toString();
                                 }
                                 config.setProperty(Constants.FRAMEWORK_SYSTEMPACKAGES_EXTRA, val);
                             }
                             if (delegate) {
                                 String val = config.getProperty(Constants.FRAMEWORK_BOOTDELEGATION);
-                                for (Clause clause : clauses) {
-                                    val += "," + clause.getName();
+                                for (Clause clause1 : clauses1) {
+                                    val += "," + clause1.getName();
                                 }
                                 config.setProperty(Constants.FRAMEWORK_BOOTDELEGATION, val);
                             }
                         }
                     }
-                }
             });
         }
     }
 
     private void installStage(Profile installedProfile, Set<Feature> allBootFeatures) throws Exception {
+        LOGGER.info("Install stage");
         //
         // Handle installed profiles
         //
@@ -754,13 +791,18 @@ public class Builder {
         // Add boot features for search
         allInstalledFeatures.addAll(allBootFeatures);
         for (String feature : installedEffective.getFeatures()) {
-            addFeatures(installedFeatures, allInstalledFeatures, feature);
+            addFeatures(allInstalledFeatures, feature, installedFeatures, true);
         }
         for (Feature feature : installedFeatures) {
+            LOGGER.info("   Feature {} is defined as an installed feature", feature.getId());
             for (Bundle bundle : feature.getBundle()) {
                 if (!ignoreDependencyFlag || !bundle.isDependency()) {
                     installArtifact(downloader, bundle.getLocation().trim());
                 }
+            }
+            // Install config files
+            for (ConfigFile configFile : feature.getConfigfile()) {
+                installArtifact(downloader, configFile.getLocation().trim());
             }
             for (Conditional cond : feature.getConditional()) {
                 for (Bundle bundle : cond.getBundle()) {
@@ -777,6 +819,7 @@ public class Builder {
     }
 
     private Set<Feature> bootStage(Profile bootProfile, Profile startupEffective) throws Exception {
+        LOGGER.info("Boot stage");
         //
         // Handle boot profiles
         //
@@ -820,10 +863,10 @@ public class Builder {
 
         // Compute startup feature dependencies
         Set<Feature> bootFeatures = new HashSet<>();
-        addFeatures(bootFeatures, allBootFeatures, generated.getName());
+        addFeatures(allBootFeatures, generated.getName(), bootFeatures, true);
         for (Feature feature : bootFeatures) {
             // the feature is a startup feature, updating startup.properties file
-            LOGGER.info("Feature " + feature.getName() + " is defined as a boot feature");
+            LOGGER.info("   Feature " + feature.getId() + " is defined as a boot feature");
             // add the feature in the system folder
             Set<String> locations = new HashSet<>();
             for (Bundle bundle : feature.getBundle()) {
@@ -871,6 +914,23 @@ public class Builder {
                     installArtifact(downloader, configFile.getLocation().trim());
                 }
             }
+            // Extract configs
+            for (Config config : feature.getConfig()) {
+                if (pidMatching(config.getName())) {
+                    Path configFile = etcDirectory.resolve(config.getName() + ".cfg");
+                    LOGGER.info("      adding config file: {}", homeDirectory.relativize(configFile));
+                    Files.write(configFile, config.getValue().getBytes());
+                }
+            }
+            for (Conditional cond : feature.getConditional()) {
+                for (Config config : cond.getConfig()) {
+                    if (pidMatching(config.getName())) {
+                        Path configFile = etcDirectory.resolve(config.getName() + ".cfg");
+                        LOGGER.info("      adding config file: {}", homeDirectory.relativize(configFile));
+                        Files.write(configFile, config.getValue().getBytes());
+                    }
+                }
+            }
             // Install libraries
             List<String> libraries = new ArrayList<>();
             for (Library library : feature.getLibraries()) {
@@ -882,7 +942,7 @@ public class Builder {
             }
             Path configPropertiesPath = etcDirectory.resolve("config.properties");
             Properties configProperties = new Properties(configPropertiesPath.toFile());
-            downloadLibraries(downloader, configProperties, libraries);
+            downloadLibraries(downloader, configProperties, libraries, "   ");
             downloader.await();
             // Reformat clauses
             reformatClauses(configProperties, Constants.FRAMEWORK_SYSTEMPACKAGES_EXTRA);
@@ -937,6 +997,113 @@ public class Builder {
         }
         downloader.await();
         return allBootFeatures;
+    }
+
+    private boolean pidMatching(String name) {
+        if (pidsToExtract == null) {
+            return true;
+        }
+        for (String p : pidsToExtract) {
+            boolean negated = false;
+            if (p.startsWith("!")) {
+                negated = true;
+                p = p.substring(1);
+            }
+            String r = globToRegex(p);
+            if (Pattern.matches(r, name)) {
+                return !negated;
+            }
+        }
+        return false;
+    }
+
+    private String globToRegex(String pattern) {
+        StringBuilder sb = new StringBuilder(pattern.length());
+        int inGroup = 0;
+        int inClass = 0;
+        int firstIndexInClass = -1;
+        char[] arr = pattern.toCharArray();
+        for (int i = 0; i < arr.length; i++) {
+            char ch = arr[i];
+            switch (ch) {
+                case '\\':
+                    if (++i >= arr.length) {
+                        sb.append('\\');
+                    } else {
+                        char next = arr[i];
+                        switch (next) {
+                            case ',':
+                                // escape not needed
+                                break;
+                            case 'Q':
+                            case 'E':
+                                // extra escape needed
+                                sb.append('\\');
+                            default:
+                                sb.append('\\');
+                        }
+                        sb.append(next);
+                    }
+                    break;
+                case '*':
+                    if (inClass == 0)
+                        sb.append(".*");
+                    else
+                        sb.append('*');
+                    break;
+                case '?':
+                    if (inClass == 0)
+                        sb.append('.');
+                    else
+                        sb.append('?');
+                    break;
+                case '[':
+                    inClass++;
+                    firstIndexInClass = i + 1;
+                    sb.append('[');
+                    break;
+                case ']':
+                    inClass--;
+                    sb.append(']');
+                    break;
+                case '.':
+                case '(':
+                case ')':
+                case '+':
+                case '|':
+                case '^':
+                case '$':
+                case '@':
+                case '%':
+                    if (inClass == 0 || (firstIndexInClass == i && ch == '^'))
+                        sb.append('\\');
+                    sb.append(ch);
+                    break;
+                case '!':
+                    if (firstIndexInClass == i)
+                        sb.append('^');
+                    else
+                        sb.append('!');
+                    break;
+                case '{':
+                    inGroup++;
+                    sb.append('(');
+                    break;
+                case '}':
+                    inGroup--;
+                    sb.append(')');
+                    break;
+                case ',':
+                    if (inGroup > 0)
+                        sb.append('|');
+                    else
+                        sb.append(',');
+                    break;
+                default:
+                    sb.append(ch);
+            }
+        }
+        return sb.toString();
     }
 
     private String getRepos(Features rep) {
@@ -997,19 +1164,20 @@ public class Builder {
     }
 
     private Profile startupStage(Profile startupProfile) throws Exception {
+        LOGGER.info("Startup stage");
         //
         // Compute startup
         //
         Profile startupOverlay = Profiles.getOverlay(startupProfile, allProfiles, environment);
         Profile startupEffective = Profiles.getEffective(startupOverlay, false);
         // Load startup repositories
-        LOGGER.info("Loading repositories");
+        LOGGER.info("   Loading repositories");
         Map<String, Features> startupRepositories = loadRepositories(manager, startupEffective.getRepositories(), false);
 
         //
         // Resolve
         //
-        LOGGER.info("Resolving features");
+        LOGGER.info("   Resolving features");
         Map<String, Integer> bundles =
                 resolve(manager,
                         resolver,
@@ -1025,7 +1193,7 @@ public class Builder {
         Properties startup = new Properties();
         startup.setHeader(Collections.singletonList("# Bundles to be started on startup, with startlevel"));
         Map<Integer, Set<String>> invertedStartupBundles = MapUtils.invert(bundles);
-        for (Map.Entry<Integer, Set<String>> entry : invertedStartupBundles.entrySet()) {
+        for (Map.Entry<Integer, Set<String>> entry : new TreeMap<>(invertedStartupBundles).entrySet()) {
             String startLevel = Integer.toString(entry.getKey());
             for (String location : new TreeSet<>(entry.getValue())) {
                 if (useReferenceUrls) {
@@ -1048,7 +1216,7 @@ public class Builder {
     }
 
     private void installArtifact(Downloader downloader, String location) throws Exception {
-        LOGGER.info("== Installing artifact " + location);
+        LOGGER.info("      adding maven artifact: " + location);
         location = DownloadManagerHelper.stripUrl(location);
         if (location.startsWith("mvn:")) {
             if (location.endsWith("/")) {
@@ -1070,45 +1238,39 @@ public class Builder {
                 }
             });
         } else {
-            LOGGER.warn("Ignoring artifact " + location);
+            LOGGER.warn("Ignoring non maven artifact " + location);
         }
     }
 
-    private void addFeatures(Set<Feature> startupFeatures, Set<Feature> features, String featureSt) {
-        int nbFound = 0;
-        Dependency featureRef = createDependency(featureSt);
-        for (Feature f : features) {
-            if (matches(f, featureRef)) {
-                for (Dependency dep : f.getFeature()) {
-                    addFeatures(startupFeatures, features, getFeatureSt(dep));
-                }
-                startupFeatures.add(f);
-                nbFound++;
+    private void addFeatures(Set<Feature> allFeatures, String feature, Set<Feature> features, boolean mandatory) {
+        String name;
+        VersionRange range;
+        int idx = feature.indexOf('/');
+        if (idx > 0) {
+            name = feature.substring(0, idx);
+            String version = feature.substring(idx + 1);
+            version = version.trim();
+            if (version.equals(org.apache.karaf.features.internal.model.Feature.DEFAULT_VERSION)) {
+                range = new VersionRange(Version.emptyVersion);
+            } else {
+                range = new VersionRange(version, true, true);
+            }
+        } else {
+            name = feature;
+            range = new VersionRange(Version.emptyVersion);
+        }
+        Set<Feature> set = allFeatures.stream()
+                .filter(f -> f.getName().equals(name) && range.contains(VersionTable.getVersion(f.getVersion())))
+                .collect(Collectors.toSet());
+        if (mandatory && set.isEmpty()) {
+            throw new IllegalStateException("Could not find matching feature for " + feature);
+        }
+        for (Feature f : set) {
+            features.add(f);
+            for (Dependency dep : f.getFeature()) {
+                addFeatures(allFeatures, dep.toString(), features, !dep.isDependency() && !dep.isPrerequisite());
             }
         }
-        if (nbFound == 0) {
-            throw new IllegalStateException("Could not find matching feature for " + featureSt);
-        }
-    }
-
-    private String getFeatureSt(Dependency dep) {
-        String version = dep.getVersion() == null || "0.0.0".equals(dep.getVersion()) ? "" : "/" + dep.getVersion();
-        return dep.getName() + version;
-    }
-
-    /**
-     * Checks if a given feature f matches the featureRef.
-     * TODO Need to also check for version ranges. Currently ranges are ignored and all features matching the name
-     * are copied in that case.
-     *  
-     * @param f
-     * @param featureRef
-     * @return
-     */
-    private boolean matches(Feature f, Dependency featureRef) {
-        String version = featureRef.getVersion();
-        return f.getName().equals(featureRef.getName()) 
-            && (version == null || version.equals("0.0.0")|| version.startsWith("[") || f.getVersion().equals(version));
     }
 
     private List<String> getStaged(Stage stage, Map<String, Stage> data) {
@@ -1139,20 +1301,27 @@ public class Builder {
         final List<String> blacklist = new ArrayList<>();
         blacklist.addAll(blacklistedBundles);
         blacklist.addAll(blacklistedFeatures);
+        final List<String> blacklistRepos = new ArrayList<>();
+        blacklistRepos.addAll(blacklistedRepositories);
         final Clause[] clauses = org.apache.felix.utils.manifest.Parser.parseClauses(blacklist.toArray(new String[blacklist.size()]));
+        final Clause[] clausesRepos = org.apache.felix.utils.manifest.Parser.parseClauses(blacklistRepos.toArray(new String[blacklistRepos.size()]));
         for (String repository : repositories) {
             downloader.download(repository, new DownloadCallback() {
                 @Override
                 public void downloaded(final StreamProvider provider) throws Exception {
+                    String url = provider.getUrl();
+                    if (Blacklist.isBlacklisted(clausesRepos, url, TYPE_REPOSITORY)) {
+                        return;
+                    }
                     if (install) {
                         synchronized (provider) {
-                            Path path = systemDirectory.resolve(pathFromProviderUrl(provider.getUrl()));
+                            Path path = systemDirectory.resolve(pathFromProviderUrl(url));
                             Files.createDirectories(path.getParent());
                             Files.copy(provider.getFile().toPath(), path, StandardCopyOption.REPLACE_EXISTING);
                         }
                     }
                     try (InputStream is = provider.open()) {
-                        Features featuresModel = JaxbUtil.unmarshal(provider.getUrl(), is, false);
+                        Features featuresModel = JaxbUtil.unmarshal(url, is, false);
                         if (blacklistPolicy == BlacklistPolicy.Discard) {
                             Blacklist.blacklist(featuresModel, clauses);
                         }
@@ -1201,14 +1370,11 @@ public class Builder {
         final List<Resource> resources = new ArrayList<>();
         Downloader downloader = manager.createDownloader();
         for (String optional : optionals) {
-            downloader.download(optional, new DownloadCallback() {
-                @Override
-                public void downloaded(StreamProvider provider) throws Exception {
+            downloader.download(optional, provider -> {
                     Resource resource = ResourceBuilder.build(provider.getUrl(), getHeaders(provider));
                     synchronized (resources) {
                         resources.add(resource);
                     }
-                }
             });
         }
         downloader.await();
@@ -1275,10 +1441,10 @@ public class Builder {
             headers.put(attr.getKey().toString(), attr.getValue().toString());
         }
 
-        return new FakeBundleRevision(headers, "system-bundle", 0l);
+        return new FakeBundleRevision(headers, "system-bundle", 0L);
     }
 
-    Map<String, String> getHeaders(StreamProvider provider) throws IOException {
+    private Map<String, String> getHeaders(StreamProvider provider) throws IOException {
         try (
                 InputStream is = provider.open()
         ) {

@@ -25,6 +25,8 @@ import java.util.Hashtable;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -39,7 +41,7 @@ import org.osgi.framework.ServiceRegistration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class BaseActivator implements BundleActivator, SingleServiceTracker.SingleServiceListener, Runnable {
+public class BaseActivator implements BundleActivator, Runnable {
 
     protected final Logger logger = LoggerFactory.getLogger(getClass());
     protected BundleContext bundleContext;
@@ -50,7 +52,7 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
 
     private long schedulerStopTimeout = TimeUnit.MILLISECONDS.convert(30, TimeUnit.SECONDS);
 
-    private List<ServiceRegistration> registrations;
+    private final Queue<ServiceRegistration> registrations = new ConcurrentLinkedQueue<>();
     private Map<String, SingleServiceTracker> trackers = new HashMap<>();
     private ServiceRegistration managedServiceRegistration;
     private Dictionary<String, ?> configuration;
@@ -69,7 +71,9 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
         scheduled.set(true);
         doOpen();
         scheduled.set(false);
-        if (managedServiceRegistration == null && trackers.isEmpty()) {
+        if (managedServiceRegistration == null
+                && trackers.values().stream()
+                    .allMatch(t -> t.getService() != null)) {
             try {
                 doStart();
             } catch (Exception e) {
@@ -120,11 +124,12 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
     }
 
     protected void doStop() {
-        if (registrations != null) {
-            for (ServiceRegistration reg : registrations) {
-                reg.unregister();
+        while (true) {
+            ServiceRegistration reg = registrations.poll();
+            if (reg == null) {
+                break;
             }
-            registrations = null;
+            reg.unregister();
         }
     }
 
@@ -223,21 +228,6 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
         return def;
     }
 
-    @Override
-    public void serviceFound() {
-        reconfigure();
-    }
-
-    @Override
-    public void serviceLost() {
-        reconfigure();
-    }
-
-    @Override
-    public void serviceReplaced() {
-        reconfigure();
-    }
-
     protected void reconfigure() {
         if (scheduled.compareAndSet(false, true)) {
             executor.submit(this);
@@ -264,7 +254,7 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
      */
     protected void trackService(Class<?> clazz) throws InvalidSyntaxException {
         if (!trackers.containsKey(clazz.getName())) {
-            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, clazz, this);
+            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, clazz, (u, v) -> reconfigure());
             tracker.open();
             trackers.put(clazz.getName(), tracker);
         }
@@ -282,7 +272,7 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
             if (filter != null && filter.isEmpty()) {
                 filter = null;
             }
-            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, clazz, filter, this);
+            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, clazz, filter, (u, v) -> reconfigure());
             tracker.open();
             trackers.put(clazz.getName(), tracker);
         }
@@ -290,7 +280,7 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
 
     protected void trackService(String className, String filter) throws InvalidSyntaxException {
         if (!trackers.containsKey(className)) {
-            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, className, filter, this);
+            SingleServiceTracker tracker = new SingleServiceTracker<>(bundleContext, className, filter, (u, v) -> reconfigure());
             tracker.open();
             trackers.put(className, tracker);
         }
@@ -318,8 +308,19 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
      * @param type The MBean type to register.
      */
     protected void registerMBean(Object mbean, String type) {
+        String name = "org.apache.karaf:" + type + ",name=" + System.getProperty("karaf.name");
+        registerMBeanWithName(mbean, name);
+    }
+
+    /**
+     * Called in {@link #doStart()}.
+     *
+     * @param mbean The MBean to register.
+     * @param name The MBean name.
+     */
+    protected void registerMBeanWithName(Object mbean, String name) {
         Hashtable<String, Object> props = new Hashtable<>();
-        props.put("jmx.objectname", "org.apache.karaf:" + type + ",name=" + System.getProperty("karaf.name"));
+        props.put("jmx.objectname", name);
         trackRegistration(bundleContext.registerService(getInterfaceNames(mbean), mbean, props));
     }
 
@@ -372,9 +373,6 @@ public class BaseActivator implements BundleActivator, SingleServiceTracker.Sing
     }
 
     private void trackRegistration(ServiceRegistration registration) {
-        if (registrations == null) {
-            registrations = new ArrayList<>();
-        }
         registrations.add(registration);
     }
 

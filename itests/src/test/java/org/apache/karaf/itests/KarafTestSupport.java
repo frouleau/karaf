@@ -61,10 +61,16 @@ import org.apache.karaf.shell.api.console.Session;
 import org.apache.karaf.shell.api.console.SessionFactory;
 import org.junit.Assert;
 import org.junit.Rule;
+import org.junit.rules.TestRule;
+import org.junit.runner.Description;
+import org.junit.runners.model.Statement;
+
 import org.ops4j.pax.exam.Configuration;
 import org.ops4j.pax.exam.Option;
 import org.ops4j.pax.exam.ProbeBuilder;
+import org.ops4j.pax.exam.RerunTestException;
 import org.ops4j.pax.exam.TestProbeBuilder;
+import org.ops4j.pax.exam.karaf.options.KarafDistributionOption;
 import org.ops4j.pax.exam.karaf.options.LogLevelOption.LogLevel;
 import org.ops4j.pax.exam.options.MavenArtifactUrlReference;
 import org.osgi.framework.Bundle;
@@ -112,12 +118,53 @@ public class KarafTestSupport {
 
     @Inject
     protected ConfigurationAdmin configurationAdmin;
-
+    
+    
     /**
      * To make sure the tests run only when the boot features are fully installed
      */
     @Inject
     BootFinished bootFinished;
+    
+    public static class Retry implements TestRule {
+        private static boolean retry = true;
+        
+        public Retry(boolean retry) {
+            Retry.retry = retry;
+        }
+
+        public Statement apply(Statement base, Description description) {
+            return statement(base, description);
+        }
+
+        private Statement statement(final Statement base, final Description description) {
+            return new Statement() {
+                @Override
+                public void evaluate() throws Throwable {
+                    Throwable caughtThrowable = null;
+                    
+                    // implement retry logic here
+                    // retry once to honor the FeatureService refresh
+                    try {
+                        base.evaluate();
+                        return;
+                    } catch (Throwable t) {
+                        LOG.debug(t.getMessage(), t);
+                        if (retry && !(t instanceof org.junit.AssumptionViolatedException)) {
+                            retry = false;
+                            throw new RerunTestException("rerun this test pls", t);
+                        } else {
+                            throw t;
+                        }
+                    }
+                                        
+                }
+            };
+        }
+    }
+
+    @Rule
+    public Retry retry = new Retry(true);
 
     @ProbeBuilder
     public TestProbeBuilder probeConfiguration(TestProbeBuilder probe) {
@@ -143,13 +190,14 @@ public class KarafTestSupport {
         String sshPort = Integer.toString(getAvailablePort(Integer.parseInt(MIN_SSH_PORT), Integer.parseInt(MAX_SSH_PORT)));
 
         return new Option[]{
-            // KarafDistributionOption.debugConfiguration("8889", true),
+            //KarafDistributionOption.debugConfiguration("8889", true),
             karafDistributionConfiguration().frameworkUrl(karafUrl).name("Apache Karaf").unpackDirectory(new File("target/exam")),
             // enable JMX RBAC security, thanks to the KarafMBeanServerBuilder
             configureSecurity().disableKarafMBeanServerBuilder(),
             keepRuntimeFolder(),
             logLevel(LogLevel.INFO),
             replaceConfigurationFile("etc/org.ops4j.pax.logging.cfg", getConfigFile("/etc/org.ops4j.pax.logging.cfg")),
+            editConfigurationFilePut("etc/org.apache.karaf.features.cfg", "updateSnapshots", "none"),
             editConfigurationFilePut("etc/org.ops4j.pax.web.cfg", "org.osgi.service.http.port", httpPort),
             editConfigurationFilePut("etc/org.apache.karaf.management.cfg", "rmiRegistryPort", rmiRegistryPort),
             editConfigurationFilePut("etc/org.apache.karaf.management.cfg", "rmiServerPort", rmiServerPort),
@@ -162,7 +210,7 @@ public class KarafTestSupport {
         };
     }
 
-    private int getAvailablePort(int min, int max) {
+    protected int getAvailablePort(int min, int max) {
         for (int i = min; i <= max; i++) {
             try {
                 ServerSocket socket = new ServerSocket(i);
@@ -441,6 +489,7 @@ public class KarafTestSupport {
                 return;
             }
         }
+        
         Assert.fail("Feature " + featureName + (featureVersion != null ? "/" + featureVersion : "") + " should be installed but is not");
     }
 
@@ -514,21 +563,21 @@ public class KarafTestSupport {
 
     protected void installAssertAndUninstallFeatures(String... feature) throws Exception {
         boolean success = false;
+        Set<String> features = new HashSet<>(Arrays.asList(feature));
     	try {
+            System.out.println("Installing " + features);
+            featureService.installFeatures(features, EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
 			for (String curFeature : feature) {
-				featureService.installFeature(curFeature, EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
 			    assertFeatureInstalled(curFeature);
 			}
             success = true;
 		} finally {
-            for (String curFeature : feature) {
-                System.out.println("Uninstalling " + curFeature);
-                try {
-                    featureService.uninstallFeature(curFeature, EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
-                } catch (Exception e) {
-                    if (success) {
-                        throw e;
-                    }
+            System.out.println("Uninstalling " + features);
+            try {
+                featureService.uninstallFeatures(features, EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
+            } catch (Exception e) {
+                if (success) {
+                    throw e;
                 }
             }
 		}
@@ -541,20 +590,20 @@ public class KarafTestSupport {
      * @param featuresBefore
      * @throws Exception
      */
-	protected void uninstallNewFeatures(Set<Feature> featuresBefore)
-			throws Exception {
+	protected void uninstallNewFeatures(Set<Feature> featuresBefore) throws Exception {
 		Feature[] features = featureService.listInstalledFeatures();
+        Set<String> uninstall = new HashSet<>();
         for (Feature curFeature : features) {
 			if (!featuresBefore.contains(curFeature)) {
-				try {
-					System.out.println("Uninstalling " + curFeature.getName());
-					featureService.uninstallFeature(curFeature.getName(), curFeature.getVersion(),
-                                                    EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
-				} catch (Exception e) {
-					LOG.error(e.getMessage(), e);
-				}
+                uninstall.add(curFeature.getId());
 			}
 		}
+        try {
+            System.out.println("Uninstalling " + uninstall);
+            featureService.uninstallFeatures(uninstall, EnumSet.of(FeaturesService.Option.NoAutoRefreshBundles));
+        } catch (Exception e) {
+            LOG.error(e.getMessage(), e);
+        }
 	}
 
     protected void close(Closeable closeAble) {

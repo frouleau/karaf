@@ -29,15 +29,17 @@ import java.util.Hashtable;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.felix.resolver.ResolverImpl;
 import org.apache.felix.utils.properties.Properties;
 import org.apache.karaf.features.FeaturesListener;
 import org.apache.karaf.features.FeaturesService;
+import org.apache.karaf.features.RegionDigraphPersistence;
 import org.apache.karaf.features.internal.management.FeaturesServiceMBeanImpl;
 import org.apache.karaf.features.internal.region.DigraphHelper;
-import org.apache.karaf.features.internal.region.SubsystemResolveContext;
 import org.apache.karaf.features.internal.repository.AggregateRepository;
 import org.apache.karaf.features.internal.repository.JsonRepository;
 import org.apache.karaf.features.internal.repository.XmlRepository;
+import org.apache.karaf.features.internal.resolver.Slf4jResolverLog;
 import org.apache.karaf.features.internal.service.BootFeaturesInstaller;
 import org.apache.karaf.features.internal.service.EventAdminListener;
 import org.apache.karaf.features.internal.service.FeatureFinder;
@@ -62,16 +64,17 @@ import org.osgi.service.resolver.Resolver;
 import org.osgi.service.url.URLStreamHandlerService;
 import org.osgi.util.tracker.ServiceTracker;
 import org.osgi.util.tracker.ServiceTrackerCustomizer;
+import org.slf4j.LoggerFactory;
 
 @Services(
     requires = {
             @RequireService(ConfigurationAdmin.class),
-            @RequireService(Resolver.class),
             @RequireService(value = URLStreamHandlerService.class, filter = "(url.handler.protocol=mvn)")
     },
     provides = {
             @ProvideService(FeaturesService.class),
-            @ProvideService(RegionDigraph.class)
+            @ProvideService(RegionDigraph.class),
+            @ProvideService(RegionDigraphPersistence.class)
     }
 )
 public class Activator extends BaseActivator {
@@ -114,27 +117,25 @@ public class Activator extends BaseActivator {
 
     protected void doStart() throws Exception {
         ConfigurationAdmin configurationAdmin = getTrackedService(ConfigurationAdmin.class);
-        Resolver resolver = getTrackedService(Resolver.class);
+        Resolver resolver = new ResolverImpl(new Slf4jResolverLog(LoggerFactory.getLogger(ResolverImpl.class)));
         URLStreamHandlerService mvnUrlHandler = getTrackedService(URLStreamHandlerService.class);
 
         if (configurationAdmin == null || mvnUrlHandler == null) {
             return;
         }
 
-        // Resolver
-//        register(Resolver.class, new ResolverImpl(new Slf4jResolverLog(LoggerFactory.getLogger(ResolverImpl.class))));
-
         // RegionDigraph
-        digraph = DigraphHelper.loadDigraph(bundleContext);
-        register(ResolverHookFactory.class, digraph.getResolverHookFactory());
-        register(CollisionHook.class, CollisionHookHelper.getCollisionHook(digraph));
-        register(org.osgi.framework.hooks.bundle.FindHook.class, digraph.getBundleFindHook());
-        register(org.osgi.framework.hooks.bundle.EventHook.class, digraph.getBundleEventHook());
-        register(org.osgi.framework.hooks.service.FindHook.class, digraph.getServiceFindHook());
-        register(org.osgi.framework.hooks.service.EventHook.class, digraph.getServiceEventHook());
-        register(RegionDigraph.class, digraph);
-        digraphMBean = new StandardManageableRegionDigraph(digraph, "org.apache.karaf", bundleContext);
-        digraphMBean.registerMBean();
+        StandardRegionDigraph dg = digraph = DigraphHelper.loadDigraph(bundleContext);
+        register(ResolverHookFactory.class, dg.getResolverHookFactory());
+        register(CollisionHook.class, CollisionHookHelper.getCollisionHook(dg));
+        register(org.osgi.framework.hooks.bundle.FindHook.class, dg.getBundleFindHook());
+        register(org.osgi.framework.hooks.bundle.EventHook.class, dg.getBundleEventHook());
+        register(org.osgi.framework.hooks.service.FindHook.class, dg.getServiceFindHook());
+        register(org.osgi.framework.hooks.service.EventHook.class, dg.getServiceEventHook());
+        register(RegionDigraph.class, dg);
+        register(RegionDigraphPersistence.class, this::doPersistRegionDigraph);
+        StandardManageableRegionDigraph dgmb = digraphMBean = new StandardManageableRegionDigraph(dg, "org.apache.karaf", bundleContext);
+        dgmb.registerMBean();
 
 
         FeatureFinder featureFinder = new FeatureFinder();
@@ -206,13 +207,14 @@ public class Activator extends BaseActivator {
         }
         featuresService = new FeaturesServiceImpl(
                 bundleContext.getBundle(),
+                bundleContext,
                 bundleContext.getBundle(0).getBundleContext(),
                 stateStorage,
                 featureFinder,
                 eventAdminListener,
                 configurationAdmin,
                 resolver,
-                digraph,
+                dg,
                 overrides,
                 featureResolutionRange,
                 bundleUpdateRange,
@@ -250,6 +252,11 @@ public class Activator extends BaseActivator {
         );
         featuresListenerTracker.open();
 
+        FeaturesServiceMBeanImpl featuresServiceMBean = new FeaturesServiceMBeanImpl();
+        featuresServiceMBean.setBundleContext(bundleContext);
+        featuresServiceMBean.setFeaturesService(featuresService);
+        registerMBean(featuresServiceMBean, "type=feature");
+
         String featuresRepositories = getString("featuresRepositories", "");
         String featuresBoot = getString("featuresBoot", "");
         boolean featuresBootAsynchronous = getBoolean("featuresBootAsynchronous", false);
@@ -257,11 +264,6 @@ public class Activator extends BaseActivator {
                 bundleContext, featuresService,
                 featuresRepositories, featuresBoot, featuresBootAsynchronous);
         bootFeaturesInstaller.start();
-
-        FeaturesServiceMBeanImpl featuresServiceMBean = new FeaturesServiceMBeanImpl();
-        featuresServiceMBean.setBundleContext(bundleContext);
-        featuresServiceMBean.setFeaturesService(featuresService);
-        registerMBean(featuresServiceMBean, "type=feature");
     }
 
     protected void doStop() {
@@ -275,15 +277,22 @@ public class Activator extends BaseActivator {
         }
         super.doStop();
         if (featuresService != null) {
+            featuresService.stop();
             featuresService = null;
         }
+        if (digraph != null) {
+            doPersistRegionDigraph();
+            digraph = null;
+        }
+    }
+
+    private void doPersistRegionDigraph() {
         if (digraph != null) {
             try {
                 DigraphHelper.saveDigraph(bundleContext, digraph);
             } catch (Exception e) {
                 // Ignore
             }
-            digraph = null;
         }
     }
 

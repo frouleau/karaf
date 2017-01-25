@@ -77,7 +77,6 @@ public class StringsCompleter
         return strings;
     }
 
-    @SuppressWarnings({ "rawtypes", "unchecked" })
     public int complete(final Session session, final CommandLine commandLine, final List<String> candidates) {
         // buffer could be null
         assert candidates != null;
@@ -103,11 +102,6 @@ public class StringsCompleter
 
             // noinspection unchecked
             candidates.add(match);
-        }
-
-        if (candidates.size() == 1) {
-            // noinspection unchecked
-            candidates.set(0, candidates.get(0) + " ");
         }
 
         return candidates.isEmpty() ? -1 : commandLine.getBufferPosition() - commandLine.getArgumentPosition();

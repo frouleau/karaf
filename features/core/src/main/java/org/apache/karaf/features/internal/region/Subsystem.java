@@ -343,9 +343,20 @@ public class Subsystem extends ResourceImpl {
             child.doCollectPrerequisites(prereqs);
         }
         if (feature != null) {
-            for (Dependency dep : feature.getDependencies()) {
-                if (dep.isPrerequisite()) {
-                    prereqs.add(dep.toString());
+            boolean match = false;
+            for (String prereq : prereqs) {
+                String[] p = prereq.split("/");
+                if (feature.getName().equals(p[0])
+                        && VersionRange.parseVersionRange(p[1]).contains(Version.parseVersion(feature.getVersion()))) {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match) {
+                for (Dependency dep : feature.getDependencies()) {
+                    if (dep.isPrerequisite()) {
+                        prereqs.add(dep.toString());
+                    }
                 }
             }
         }
@@ -355,7 +366,8 @@ public class Subsystem extends ResourceImpl {
     public void downloadBundles(DownloadManager manager,
                                 Set<String> overrides,
                                 String featureResolutionRange,
-                                final String serviceRequirements, RepositoryManager repos) throws Exception {
+                                final String serviceRequirements,
+                                RepositoryManager repos) throws Exception {
         for (Subsystem child : children) {
             child.downloadBundles(manager, overrides, featureResolutionRange, serviceRequirements, repos);
         }

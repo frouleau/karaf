@@ -16,16 +16,16 @@
  */
 package org.apache.karaf.scr.command.support;
 
-import org.apache.felix.scr.Component;
-
 import java.util.Comparator;
 
-public class IdComparator implements Comparator<Component> {
+import org.osgi.service.component.runtime.dto.ComponentConfigurationDTO;
+
+public class IdComparator implements Comparator<ComponentConfigurationDTO> {
     @Override
-    public int compare(Component left, Component right) {
-        if (left.getId() < right.getId()) {
+    public int compare(ComponentConfigurationDTO left, ComponentConfigurationDTO right) {
+        if (left.id < right.id) {
             return -1;
-        } else if (left.getId() == right.getId()) {
+        } else if (left.id == right.id) {
             return 0;
         } else {
             return 1;

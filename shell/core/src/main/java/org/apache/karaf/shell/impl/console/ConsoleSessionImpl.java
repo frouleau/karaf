@@ -18,46 +18,59 @@
  */
 package org.apache.karaf.shell.impl.console;
 
-import java.io.CharArrayWriter;
-import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.InterruptedIOException;
 import java.io.PrintStream;
-import java.io.Reader;
 import java.lang.management.ManagementFactory;
+import java.nio.file.FileVisitor;
+import java.nio.file.FileVisitOption;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.PathMatcher;
+import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.Set;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
-import jline.UnsupportedTerminal;
-import jline.console.ConsoleReader;
-import jline.console.history.MemoryHistory;
-import jline.console.history.PersistentHistory;
+import org.apache.felix.gogo.jline.Shell;
+import org.apache.felix.gogo.runtime.CommandSessionImpl;
 import org.apache.felix.service.command.CommandProcessor;
 import org.apache.felix.service.command.CommandSession;
 import org.apache.felix.service.command.Converter;
 import org.apache.felix.service.command.Function;
+import org.apache.felix.service.command.Job;
+import org.apache.felix.service.command.Job.Status;
 import org.apache.felix.service.threadio.ThreadIO;
 import org.apache.karaf.shell.api.console.Command;
-import org.apache.karaf.shell.api.console.Completer;
 import org.apache.karaf.shell.api.console.History;
 import org.apache.karaf.shell.api.console.Registry;
 import org.apache.karaf.shell.api.console.Session;
 import org.apache.karaf.shell.api.console.SessionFactory;
 import org.apache.karaf.shell.api.console.Terminal;
 import org.apache.karaf.shell.impl.console.parsing.CommandLineParser;
+import org.apache.karaf.shell.impl.console.parsing.KarafParser;
 import org.apache.karaf.shell.support.ShellUtil;
 import org.apache.karaf.shell.support.completers.FileCompleter;
 import org.apache.karaf.shell.support.completers.FileOrUriCompleter;
 import org.apache.karaf.shell.support.completers.UriCompleter;
+import org.jline.builtins.Completers;
+import org.jline.reader.*;
+import org.jline.reader.impl.LineReaderImpl;
+import org.jline.reader.impl.history.DefaultHistory;
+import org.jline.terminal.Terminal.Signal;
+import org.jline.terminal.impl.DumbTerminal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,15 +80,13 @@ public class ConsoleSessionImpl implements Session {
     public static final String SHELL_HISTORY_MAXSIZE = "karaf.shell.history.maxSize";
     public static final String PROMPT = "PROMPT";
     public static final String DEFAULT_PROMPT = "\u001B[1m${USER}\u001B[0m@${APPLICATION}(${SUBSHELL})> ";
+    public static final String RPROMPT = "RPROMPT";
+    public static final String DEFAULT_RPROMPT = null;
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ConsoleSessionImpl.class);
 
     // Input stream
-    final BlockingQueue<Integer> queue = new ArrayBlockingQueue<Integer>(1024);
-    final ConsoleInputStream console = new ConsoleInputStream();
-    final Pipe pipe = new Pipe();
     volatile boolean running;
-    volatile boolean eof;
 
     final SessionFactory factory;
     final ThreadIO threadIO;
@@ -87,10 +98,10 @@ public class ConsoleSessionImpl implements Session {
     final CommandSession session;
     final Registry registry;
     final Terminal terminal;
+    final org.jline.terminal.Terminal jlineTerminal;
     final History history;
-    final ConsoleReader reader;
+    final LineReaderImpl reader;
 
-    private boolean interrupt;
     private Thread thread;
 
     public ConsoleSessionImpl(SessionFactory factory,
@@ -111,33 +122,40 @@ public class ConsoleSessionImpl implements Session {
         this.closeCallback = closeCallback;
 
         // Terminal
-        terminal = term == null ? new JLineTerminal(new UnsupportedTerminal(), "dumb") : term;
+        if (term instanceof org.jline.terminal.Terminal) {
+            terminal = term;
+            jlineTerminal = (org.jline.terminal.Terminal) term;
+        } else if (term != null) {
+            terminal = term;
+//            jlineTerminal = new KarafTerminal(term);
+            // TODO:JLINE
+            throw new UnsupportedOperationException();
+        } else {
+            try {
+                jlineTerminal = new DumbTerminal(in, out);
+                terminal = new JLineTerminal(jlineTerminal);
+            } catch (IOException e) {
+                throw new RuntimeException("Unable to create terminal", e);
+            }
+        }
+
+        // Create session
+        session = processor.createSession(jlineTerminal.input(),
+                jlineTerminal.output(),
+                jlineTerminal.output());
 
         // Console reader
-        try {
-            System.setProperty("jline.sigcont", "true");
-            reader = new ConsoleReader(null,
-                    in != null ? console : null,
-                    out,
-                    terminal instanceof JLineTerminal ? ((JLineTerminal) terminal).getTerminal() : new KarafTerminal(terminal),
-                    encoding);
-        } catch (IOException e) {
-            throw new RuntimeException("Error opening console reader", e);
-        }
+        reader = new LineReaderImpl(
+                jlineTerminal,
+                "karaf",
+                ((CommandSessionImpl) session).getVariables());
 
         // History
-        final File file = getHistoryFile();
-        try {
-            file.getParentFile().mkdirs();
-            reader.setHistory(new KarafFileHistory(file));
-        } catch (Exception e) {
-            LOGGER.error("Can not read history from file " + file + ". Using in memory history", e);
-        }
-        if (reader.getHistory() instanceof MemoryHistory) {
-            String maxSizeStr = System.getProperty(SHELL_HISTORY_MAXSIZE);
-            if (maxSizeStr != null) {
-                ((MemoryHistory) this.reader.getHistory()).setMaxSize(Integer.parseInt(maxSizeStr));
-            }
+        final Path file = getHistoryFile();
+        reader.setVariable(LineReader.HISTORY_FILE, file);
+        String maxSizeStr = System.getProperty(SHELL_HISTORY_MAXSIZE);
+        if (maxSizeStr != null) {
+            reader.setVariable(LineReader.HISTORY_SIZE, Integer.parseInt(maxSizeStr));
         }
         history = new HistoryWrapper(reader.getHistory());
 
@@ -150,16 +168,43 @@ public class ConsoleSessionImpl implements Session {
         registry.register(history);
 
         // Completers
-        Completer completer = new CommandsCompleter(factory);
-        reader.addCompleter(new CompleterAsCompletor(this, completer));
-        registry.register(completer);
+        Completers.CompletionEnvironment env = new Completers.CompletionEnvironment() {
+            @Override
+            public Map<String, List<Completers.CompletionData>> getCompletions() {
+                return Shell.getCompletions(session);
+            }
+            @Override
+            public Set<String> getCommands() {
+                return Shell.getCommands(session);
+            }
+            @Override
+            public String resolveCommand(String command) {
+                return Shell.resolve(session, command);
+            }
+            @Override
+            public String commandName(String command) {
+                int idx = command.indexOf(':');
+                return idx >= 0 ? command.substring(idx + 1) : command;
+            }
+            @Override
+            public Object evaluate(LineReader reader, ParsedLine line, String func) throws Exception {
+                session.put(Shell.VAR_COMMAND_LINE, line);
+                return session.execute(func);
+            }
+        };
+        Completer builtinCompleter = new org.jline.builtins.Completers.Completer(env);
+        CommandsCompleter commandsCompleter = new CommandsCompleter(factory, this);
+        reader.setCompleter((rdr, line, candidates) -> {
+            builtinCompleter.complete(rdr, line, candidates);
+            commandsCompleter.complete(rdr, line, candidates);
+        });
+        registry.register(commandsCompleter);
         registry.register(new CommandNamesCompleter());
         registry.register(new FileCompleter());
         registry.register(new UriCompleter());
         registry.register(new FileOrUriCompleter());
 
         // Session
-        session = processor.createSession(in != null ? console : null, out, err);
         Properties sysProps = System.getProperties();
         for (Object key : sysProps.keySet()) {
             session.put(key.toString(), sysProps.get(key));
@@ -175,17 +220,18 @@ public class ConsoleSessionImpl implements Session {
         session.put("USER", ShellUtil.getCurrentUserName());
         session.put("TERM", terminal.getType());
         session.put("APPLICATION", System.getProperty("karaf.name", "root"));
-        session.put("#LINES", new Function() {
-            public Object execute(CommandSession session, List<Object> arguments) throws Exception {
-                return Integer.toString(terminal.getHeight());
-            }
-        });
-        session.put("#COLUMNS", new Function() {
-            public Object execute(CommandSession session, List<Object> arguments) throws Exception {
-                return Integer.toString(terminal.getWidth());
-            }
-        });
+        session.put("#LINES", (Function) (session, arguments) -> Integer.toString(terminal.getHeight()));
+        session.put("#COLUMNS", (Function) (session, arguments) -> Integer.toString(terminal.getWidth()));
         session.put("pid", getPid());
+        session.put(Shell.VAR_COMPLETIONS, new HashMap<>());
+        session.put(Shell.VAR_READER, reader);
+        session.put(Shell.VAR_TERMINAL, reader.getTerminal());
+        session.put(CommandSession.OPTION_NO_GLOB, Boolean.TRUE);
+        session.currentDir(Paths.get(System.getProperty("user.dir")).toAbsolutePath().normalize());
+
+        reader.setHighlighter(new org.apache.felix.gogo.jline.Highlighter(session));
+        reader.setParser(new KarafParser(this));
+
     }
 
     /**
@@ -193,9 +239,9 @@ public class ConsoleSessionImpl implements Session {
      *
      * @return the history file
      */
-    protected File getHistoryFile() {
-        String defaultHistoryPath = new File(System.getProperty("user.home"), ".karaf/karaf.history").toString();
-        return new File(System.getProperty("karaf.history", defaultHistoryPath));
+    protected Path getHistoryFile() {
+        String defaultHistoryPath = new File(System.getProperty("user.home"), ".karaf/karaf41.history").toString();
+        return Paths.get(System.getProperty("karaf.history", defaultHistoryPath));
     }
 
     @Override
@@ -218,31 +264,22 @@ public class ConsoleSessionImpl implements Session {
     }
 
     public void close() {
-        if (!running) {
-            return;
-        }
-        out.println();
-        if (reader.getHistory() instanceof PersistentHistory) {
-            try {
-                ((PersistentHistory) reader.getHistory()).flush();
-            } catch (IOException e) {
-                // ignore
+        if (running) {
+            reader.getHistory().save();
+
+            running = false;
+            if (thread != Thread.currentThread()) {
+                thread.interrupt();
             }
-        }
-        running = false;
-        pipe.interrupt();
-        if (thread != Thread.currentThread()) {
-            thread.interrupt();
-        }
-        reader.shutdown();
-        if (closeCallback != null) {
-            closeCallback.run();
-        }
-        if (terminal instanceof Closeable) {
-            try {
-                ((Closeable) terminal).close();
-            } catch (IOException e) {
-                // Ignore
+            if (closeCallback != null) {
+                closeCallback.run();
+            }
+            if (terminal instanceof AutoCloseable) {
+                try {
+                    ((AutoCloseable) terminal).close();
+                } catch (Exception e) {
+                    // Ignore
+                }
             }
         }
         if (session != null)
@@ -254,28 +291,63 @@ public class ConsoleSessionImpl implements Session {
             threadIO.setStreams(session.getKeyboard(), out, err);
             thread = Thread.currentThread();
             running = true;
-            pipe.start();
             Properties brandingProps = Branding.loadBrandingProperties(terminal);
             welcome(brandingProps);
             setSessionProperties(brandingProps);
+
+            AtomicBoolean reading = new AtomicBoolean();
+
+            session.setJobListener((job, previous, current) -> {
+                if (previous == Status.Background || current == Status.Background
+                        || previous == Status.Suspended || current == Status.Suspended) {
+                    int width = terminal.getWidth();
+                    String status = current.name().toLowerCase();
+                    jlineTerminal.writer().write(getStatusLine(job, width, status));
+                    jlineTerminal.flush();
+                    if (reading.get()) {
+                        reader.redrawLine();
+                        reader.redisplay();
+                    }
+                }
+            });
+            jlineTerminal.handle(Signal.TSTP, s -> {
+                Job current = session.foregroundJob();
+                if (current != null) {
+                    current.suspend();
+                }
+            });
+            jlineTerminal.handle(Signal.INT, s -> {
+                Job current = session.foregroundJob();
+                if (current != null) {
+                    current.interrupt();
+                }
+            });
+
             String scriptFileName = System.getProperty(SHELL_INIT_SCRIPT);
             executeScript(scriptFileName);
             while (running) {
+                String command = null;
+                reading.set(true);
                 try {
-                    String command = readAndParseCommand();
-                    if (command == null) {
-                        break;
-                    }
-                    //session.getConsole().println("Executing: " + line);
+                    command = reader.readLine(getPrompt(), getRPrompt(), null, null);
+                } catch (EndOfFileException e) {
+                    break;
+                } catch (UserInterruptException e) {
+                    // Ignore, loop again
+                    continue;
+                } catch (Throwable t) {
+                    ShellUtil.logException(this, t);
+                } finally {
+                    reading.set(false);
+                }
+                if (command == null) {
+                    break;
+                }
+                try {
                     Object result = session.execute(command);
                     if (result != null) {
                         session.getConsole().println(session.format(result, Converter.INSPECT));
                     }
-                } catch (InterruptedIOException e) {
-                    //System.err.println("^C");
-                    // TODO: interrupt current thread
-                } catch (InterruptedException e) {
-                    //interrupt current thread
                 } catch (Throwable t) {
                     ShellUtil.logException(this, t);
                 }
@@ -288,6 +360,21 @@ public class ConsoleSessionImpl implements Session {
                 // Ignore
             }
         }
+    }
+
+    private String getStatusLine(Job job, int width, String status) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < width - 1; i++) {
+            sb.append(' ');
+        }
+        sb.append('\r');
+        sb.append("[").append(job.id()).append("]  ");
+        sb.append(status);
+        for (int i = status.length(); i < "background".length(); i++) {
+            sb.append(' ');
+        }
+        sb.append("  ").append(job.command()).append("\n");
+        return sb.toString();
     }
 
     @Override
@@ -335,11 +422,11 @@ public class ConsoleSessionImpl implements Session {
 
     @Override
     public String readLine(String prompt, Character mask) throws IOException {
-        reader.setHistoryEnabled(false);
         try {
+            reader.getVariables().put(LineReader.DISABLE_HISTORY, Boolean.TRUE);
             return reader.readLine(prompt, mask);
         } finally {
-            reader.setHistoryEnabled(true);
+            reader.getVariables().remove(LineReader.DISABLE_HISTORY);
         }
     }
 
@@ -361,72 +448,124 @@ public class ConsoleSessionImpl implements Session {
         return mode;
     }
 
-    private String readAndParseCommand() throws IOException {
-        String command = null;
-        boolean first = true;
-        while (true) {
-            checkInterrupt();
-            String line = reader.readLine(first ? getPrompt() : "> ");
-            if (line == null) {
-                return null;
-            }
-            if (command == null) {
-                command = line;
-            } else {
-                if (command.charAt(command.length() - 1) == '\\') {
-                    command = command.substring(0, command.length() - 1) + line;
-                } else {
-                    command += "\n" + line;
-                }
-            }
-            if (reader.getHistory().size() == 0) {
-                reader.getHistory().add(command);
-            } else {
-                // jline doesn't add blank lines to the history so we don't
-                // need to replace the command in jline's console history with
-                // an indented one
-                if (command.length() > 0 && !" ".equals(command)) {
-                    reader.getHistory().replace(command);
-                }
-            }
-            if (command.length() > 0 && command.charAt(command.length() - 1) == '\\') {
-                first = false;
-            } else {
-                try {
-                    return CommandLineParser.parse(this, command);
-                } catch (Exception e) {
-                    first = false;
-                }
-            }
+    private void executeScript(String names) {
+        generateFiles(names).forEach(this::doExecuteScript);
+    }
+
+    private void doExecuteScript(Path scriptFileName) {
+        try {
+            String script = String.join("\n",
+                    Files.readAllLines(scriptFileName));
+            session.execute(script);
+        } catch (Exception e) {
+            LOGGER.debug("Error in initialization script {}", scriptFileName, e);
+            System.err.println("Error in initialization script: " + scriptFileName + ": " + e.getMessage());
         }
     }
 
-    private void executeScript(String scriptFileName) {
-        if (scriptFileName != null) {
-            Reader r = null;
-            try {
-                File scriptFile = new File(scriptFileName);
-                r = new InputStreamReader(new FileInputStream(scriptFile));
-                CharArrayWriter w = new CharArrayWriter();
-                int n;
-                char[] buf = new char[8192];
-                while ((n = r.read(buf)) > 0) {
-                    w.write(buf, 0, n);
+    private Stream<Path> generateFiles(String scriptFileName) {
+        if (scriptFileName == null) {
+            return Stream.empty();
+        }
+        List<String> files = new ArrayList<>();
+        List<String> generators = new ArrayList<>();
+        StringBuilder buf = new StringBuilder(scriptFileName.length());
+        boolean hasUnescapedReserved = false;
+        boolean escaped = false;
+        for (int i = 0; i < scriptFileName.length(); i++) {
+            char c = scriptFileName.charAt(i);
+            if (escaped) {
+                buf.append(c);
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == ',') {
+                if (hasUnescapedReserved) {
+                    generators.add(buf.toString());
+                } else {
+                    files.add(buf.toString());
                 }
-                session.execute(new String(w.toCharArray()));
-            } catch (Exception e) {
-                LOGGER.debug("Error in initialization script", e);
-                System.err.println("Error in initialization script: " + e.getMessage());
-            } finally {
-                if (r != null) {
-                    try {
-                        r.close();
-                    } catch (IOException e) {
-                        // Ignore
-                    }
-                }
+                hasUnescapedReserved = false;
+                buf.setLength(0);
+            } else if ("*?{[".indexOf(c) >= 0) {
+                hasUnescapedReserved = true;
+                buf.append(c);
+            } else {
+                buf.append(c);
             }
         }
+        if (buf.length() > 0) {
+            if (hasUnescapedReserved) {
+                generators.add(buf.toString());
+            } else {
+                files.add(buf.toString());
+            }
+        }
+        Path cur = Paths.get(System.getProperty("karaf.base"));
+        return Stream.concat(
+                files.stream().map(cur::resolve),
+                generators.stream().flatMap(s -> files(cur, s)));
+    }
+
+    private Stream<Path> files(Path cur, String glob) {
+        String prefix;
+        String rem;
+        int idx = glob.lastIndexOf('/');
+        if (idx >= 0) {
+            prefix = glob.substring(0, idx + 1);
+            rem = glob.substring(idx + 1);
+        } else {
+            prefix = "";
+            rem = glob;
+        }
+        Path dir = cur.resolve(prefix);
+        final PathMatcher matcher = dir.getFileSystem().getPathMatcher("glob:" + rem);
+        Stream.Builder<Path> stream = Stream.builder();
+        try {
+            Files.walkFileTree(dir,
+                    EnumSet.of(FileVisitOption.FOLLOW_LINKS),
+                    Integer.MAX_VALUE,
+                    new FileVisitor<Path>() {
+                        @Override
+                        public FileVisitResult preVisitDirectory(Path file, BasicFileAttributes attrs) throws IOException {
+                            if (file.equals(dir)) {
+                                return FileVisitResult.CONTINUE;
+                            }
+                            if (Files.isHidden(file)) {
+                                return FileVisitResult.SKIP_SUBTREE;
+                            }
+                            Path r = dir.relativize(file);
+                            if (matcher.matches(r)) {
+                                stream.add(file);
+                            }
+                            return FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
+                        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                            if (!Files.isHidden(file)) {
+                                Path r = dir.relativize(file);
+                                if (matcher.matches(r)) {
+                                    stream.add(file);
+                                }
+                            }
+                            return FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
+                        public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+                            return FileVisitResult.CONTINUE;
+                        }
+
+                        @Override
+                        public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                            return FileVisitResult.CONTINUE;
+                        }
+                    });
+        } catch (IOException e) {
+            LOGGER.warn("Error generating filenames", e);
+        }
+        return stream.build();
     }
 
     protected void welcome(Properties brandingProps) {
@@ -446,32 +585,48 @@ public class ConsoleSessionImpl implements Session {
     }
 
     protected String getPrompt() {
+        return doGetPrompt(PROMPT, DEFAULT_PROMPT);
+    }
+
+    protected String getRPrompt() {
+        return doGetPrompt(RPROMPT, DEFAULT_RPROMPT);
+    }
+
+    protected String doGetPrompt(String var, String def) {
         try {
             String prompt;
             try {
-                Object p = session.get(PROMPT);
+                Object p = session.get(var);
                 if (p != null) {
                     prompt = p.toString();
                 } else {
-                    Properties properties = Branding.loadBrandingProperties(terminal);
-                    if (properties.getProperty("prompt") != null) {
-                        prompt = properties.getProperty("prompt");
-                        // we put the PROMPT in ConsoleSession to avoid to read
-                        // the properties file each time.
-                        session.put(PROMPT, prompt);
+                    var = var.toLowerCase();
+                    p = session.get(var);
+                    if (p != null) {
+                        prompt = p.toString();
                     } else {
-                        prompt = DEFAULT_PROMPT;
+                        Properties properties = Branding.loadBrandingProperties(terminal);
+                        if (properties.getProperty(var) != null) {
+                            prompt = properties.getProperty(var);
+                            // we put the PROMPT in ConsoleSession to avoid to read
+                            // the properties file each time.
+                            session.put(var, prompt);
+                        } else {
+                            prompt = def;
+                        }
                     }
                 }
             } catch (Throwable t) {
-                prompt = DEFAULT_PROMPT;
+                prompt = def;
             }
-            Matcher matcher = Pattern.compile("\\$\\{([^}]+)\\}").matcher(prompt);
-            while (matcher.find()) {
-                Object rep = session.get(matcher.group(1));
-                if (rep != null) {
-                    prompt = prompt.replace(matcher.group(0), rep.toString());
-                    matcher.reset(prompt);
+            if (prompt != null) {
+                Matcher matcher = Pattern.compile("\\$\\{([^}]+)\\}").matcher(prompt);
+                while (matcher.find()) {
+                    Object rep = session.get(matcher.group(1));
+                    if (rep != null) {
+                        prompt = prompt.replace(matcher.group(0), rep.toString());
+                        matcher.reset(prompt);
+                    }
                 }
             }
             return prompt;
@@ -480,131 +635,10 @@ public class ConsoleSessionImpl implements Session {
         }
     }
 
-    private void checkInterrupt() throws IOException {
-        if (Thread.interrupted() || interrupt) {
-            interrupt = false;
-            throw new InterruptedIOException("Keyboard interruption");
-        }
-    }
-
-    private void interrupt() {
-        interrupt = true;
-        thread.interrupt();
-    }
-
     private String getPid() {
         String name = ManagementFactory.getRuntimeMXBean().getName();
         String[] parts = name.split("@");
         return parts[0];
-    }
-
-    private class ConsoleInputStream extends InputStream {
-        private int read(boolean wait) throws IOException {
-            if (!running) {
-                return -1;
-            }
-            checkInterrupt();
-            if (eof && queue.isEmpty()) {
-                return -1;
-            }
-            Integer i;
-            if (wait) {
-                try {
-                    i = queue.take();
-                } catch (InterruptedException e) {
-                    throw new InterruptedIOException();
-                }
-                checkInterrupt();
-            } else {
-                i = queue.poll();
-            }
-            if (i == null) {
-                return -1;
-            }
-            return i;
-        }
-
-        @Override
-        public int read() throws IOException {
-            return read(true);
-        }
-
-        @Override
-        public int read(byte b[], int off, int len) throws IOException {
-            if (b == null) {
-                throw new NullPointerException();
-            } else if (off < 0 || len < 0 || len > b.length - off) {
-                throw new IndexOutOfBoundsException();
-            } else if (len == 0) {
-                return 0;
-            }
-
-            int nb = 1;
-            int i = read(true);
-            if (i < 0) {
-                return -1;
-            }
-            b[off++] = (byte) i;
-            while (nb < len) {
-                i = read(false);
-                if (i < 0) {
-                    return nb;
-                }
-                b[off++] = (byte) i;
-                nb++;
-            }
-            return nb;
-        }
-
-        @Override
-        public int available() throws IOException {
-            return queue.size();
-        }
-    }
-
-    private class Pipe extends Thread {
-        public Pipe() {
-            super("Karaf shell pipe thread");
-            setDaemon(true);
-        }
-
-        public void run() {
-            boolean useAvailable = !System.getProperty("os.name").toLowerCase().contains("windows");
-            try {
-                while (running) {
-                    try {
-                        while (useAvailable && in.available() == 0) {
-                            if (!running) {
-                                return;
-                            }
-                            Thread.sleep(50);
-                        }
-                        int c = in.read();
-                        if (c == -1) {
-                            return;
-                        } else if (c == 4 && !ShellUtil.getBoolean(ConsoleSessionImpl.this, Session.IGNORE_INTERRUPTS)) {
-                            err.print("^D");
-                            err.flush();
-                            ConsoleSessionImpl.this.interrupt();
-                            return;
-                        } else if (c == 3 && !ShellUtil.getBoolean(ConsoleSessionImpl.this, Session.IGNORE_INTERRUPTS)) {
-                            err.println("^C");
-                            reader.getCursorBuffer().clear();
-                            ConsoleSessionImpl.this.interrupt();
-                        }
-                        queue.put(c);
-                    } catch (Throwable t) {
-                        return;
-                    }
-                }
-            } finally {
-                eof = true;
-                try {
-                    queue.put(-1);
-                } catch (InterruptedException e) {
-                }
-            }
-        }
     }
 
 }
